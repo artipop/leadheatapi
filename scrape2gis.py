@@ -14,7 +14,8 @@ USER_AGENT = (
     "Chrome/136.0.0.0 Safari/537.36"
 )
 REQUEST_TIMEOUT = 20
-LINK_PREFIX = "https://link.2gis.ru/"
+# noinspection HttpUrlsUsage
+LINK_PREFIXES = ("http://link.2gis.ru/", "https://link.2gis.ru/")
 
 
 def _fetch_html(url: str) -> str:
@@ -48,7 +49,7 @@ def _extract_sites_from_html(html: str) -> list[str]:
 
     for tag in soup.find_all("a", href=True):
         href = unescape(tag["href"]).strip()
-        if not href.startswith(LINK_PREFIX):
+        if not href.startswith(LINK_PREFIXES):
             continue
 
         target = _extract_url_from_2gis_link(href)
