@@ -12,3 +12,7 @@ wheels/
 .env
 
 .idea/
+
+.crawl4ai/
+
+output/
