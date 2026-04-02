@@ -57,6 +57,7 @@ SKIP_EXTENSIONS = {
     ".wav",
     ".xml",
 }
+MULTI_PART_TLDS = {"co", "com", "org", "net", "gov", "edu"}
 
 PRICE_HINTS = (
     "price",
@@ -178,6 +179,10 @@ PRICE_SINGLE_RE = re.compile(
 )
 PHONE_RE = re.compile(r"(?:\+7|8)\s*\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}")
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+INN_LABELED_RE = re.compile(r"\bинн\b[^\d]{0,20}((?:\d[\s\u00A0]*){10,12})", re.IGNORECASE)
+OGRN_LABELED_RE = re.compile(r"\bогрн\b[^\d]{0,20}((?:\d[\s\u00A0]*){13})", re.IGNORECASE)
+OGRNIP_LABELED_RE = re.compile(r"\b(?:огрнип|огрн\s*ип)\b[^\d]{0,20}((?:\d[\s\u00A0]*){15})", re.IGNORECASE)
+FOOTER_HINTS = ("footer", "подвал", "контакт", "contact", "requisite", "реквизит", "legal", "copyright")
 RUS_NAME_RE = re.compile(
     r"\b[А-ЯЁ][а-яё]{1,30}(?:-[А-ЯЁ][а-яё]{1,30})?\s+"
     r"[А-ЯЁ][а-яё]{1,30}(?:\s+[А-ЯЁ][а-яё]{1,30})?\b"
@@ -214,6 +219,18 @@ class SpecialistEntry:
     email: str
 
 
+@dataclass(frozen=True, slots=True)
+class ContactEntry:
+    domain: str
+    source_url: str
+    source_scope: str
+    inn: str
+    ogrn: str
+    ogrnip: str
+    phones: str
+    emails: str
+
+
 def compact_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
@@ -226,6 +243,16 @@ def strip_markdown_noise(text: str) -> str:
 def normalize_host(host: str) -> str:
     host = host.lower()
     return host[4:] if host.startswith("www.") else host
+
+
+def extract_origin_domain(host: str) -> str:
+    normalized = normalize_host(host)
+    parts = [part for part in normalized.split(".") if part]
+    if len(parts) <= 2:
+        return normalized
+    if len(parts[-1]) == 2 and parts[-2] in MULTI_PART_TLDS and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
 
 
 def normalize_start_url(url: str) -> str:
@@ -246,7 +273,7 @@ def is_binary_path(path: str) -> bool:
     return any(lowered.endswith(ext) for ext in SKIP_EXTENSIONS)
 
 
-def normalize_internal_url(raw_url: str, source_url: str, root_host: str) -> str | None:
+def normalize_internal_url(raw_url: str, source_url: str, origin_domain: str) -> str | None:
     candidate = raw_url.strip()
     if not candidate:
         return None
@@ -261,7 +288,7 @@ def normalize_internal_url(raw_url: str, source_url: str, root_host: str) -> str
         return None
 
     host = normalize_host(parsed.netloc)
-    if host != root_host and not host.endswith(f".{root_host}"):
+    if host != origin_domain and not host.endswith(f".{origin_domain}"):
         return None
     if is_binary_path(parsed.path):
         return None
@@ -457,6 +484,176 @@ def extract_contact_value(pattern: re.Pattern[str], text: str) -> str:
     return compact_spaces(match.group(0)) if match else ""
 
 
+def unique_values(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        normalized = compact_spaces(value)
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(normalized)
+    return result
+
+
+def normalize_phone(phone: str) -> str:
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = f"7{digits[1:]}"
+    if len(digits) == 11 and digits.startswith("7"):
+        return f"+{digits}"
+    return compact_spaces(phone)
+
+
+def extract_labeled_digits(pattern: re.Pattern[str], text: str, allowed_lengths: set[int]) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for match in pattern.finditer(text):
+        digits = re.sub(r"\D", "", match.group(1))
+        if len(digits) not in allowed_lengths:
+            continue
+        if digits in seen:
+            continue
+        seen.add(digits)
+        values.append(digits)
+    return values
+
+
+def parse_contact_block(text: str) -> dict[str, list[str]]:
+    phones = unique_values(normalize_phone(match.group(0)) for match in PHONE_RE.finditer(text))
+    emails = unique_values(match.group(0).lower() for match in EMAIL_RE.finditer(text))
+    inns = extract_labeled_digits(INN_LABELED_RE, text, allowed_lengths={10, 12})
+    ogrns = extract_labeled_digits(OGRN_LABELED_RE, text, allowed_lengths={13})
+    ogrnips = extract_labeled_digits(OGRNIP_LABELED_RE, text, allowed_lengths={15})
+    return {
+        "phones": phones,
+        "emails": emails,
+        "inns": inns,
+        "ogrns": ogrns,
+        "ogrnips": ogrnips,
+    }
+
+
+def has_any_contact_data(contact_data: dict[str, list[str]]) -> bool:
+    return any(contact_data[field] for field in ("phones", "emails", "inns", "ogrns", "ogrnips"))
+
+
+def tag_has_footer_hint(tag: Any) -> bool:
+    if tag.name == "footer":
+        return True
+    payload_parts = [
+        str(tag.get("id", "")),
+        str(tag.get("role", "")),
+        str(tag.get("aria-label", "")),
+        " ".join(tag.get("class", [])),
+    ]
+    payload = " ".join(payload_parts).lower()
+    return any(hint in payload for hint in FOOTER_HINTS)
+
+
+def extract_footer_text(html: str) -> str:
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    chunks: list[str] = []
+    seen: set[str] = set()
+
+    for tag in soup.find_all(["footer", "div", "section", "aside"]):
+        if not tag_has_footer_hint(tag):
+            continue
+        text = compact_spaces(tag.get_text(" ", strip=True))
+        if len(text) < 20:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        chunks.append(text)
+
+    return " ".join(chunks)
+
+
+def extract_full_page_text(page: PageData) -> str:
+    chunks: list[str] = []
+    if page.markdown:
+        chunks.append(page.markdown)
+    if page.html:
+        soup = BeautifulSoup(page.html, "html.parser")
+        chunks.append(soup.get_text(" ", strip=True))
+    return compact_spaces(" ".join(chunks))
+
+
+def build_contact_entry(
+    domain: str,
+    source_url: str,
+    source_scope: str,
+    contact_data: dict[str, list[str]],
+) -> ContactEntry:
+    return ContactEntry(
+        domain=domain,
+        source_url=source_url,
+        source_scope=source_scope,
+        inn="; ".join(contact_data["inns"]),
+        ogrn="; ".join(contact_data["ogrns"]),
+        ogrnip="; ".join(contact_data["ogrnips"]),
+        phones="; ".join(contact_data["phones"]),
+        emails="; ".join(contact_data["emails"]),
+    )
+
+
+def extract_contacts_from_page(page: PageData, domain: str) -> ContactEntry | None:
+    footer_text = extract_footer_text(page.html)
+    if footer_text:
+        footer_contact_data = parse_contact_block(footer_text)
+        if has_any_contact_data(footer_contact_data):
+            return build_contact_entry(
+                domain=domain,
+                source_url=page.url,
+                source_scope="footer",
+                contact_data=footer_contact_data,
+            )
+
+    page_text = extract_full_page_text(page)
+    if not page_text:
+        return None
+    page_contact_data = parse_contact_block(page_text)
+    if not has_any_contact_data(page_contact_data):
+        return None
+    return build_contact_entry(
+        domain=domain,
+        source_url=page.url,
+        source_scope="page",
+        contact_data=page_contact_data,
+    )
+
+
+def extract_contacts(pages: Iterable[PageData], domain: str) -> list[ContactEntry]:
+    entries: list[ContactEntry] = []
+    seen: set[tuple[str, str, str, str, str, str]] = set()
+
+    for page in pages:
+        entry = extract_contacts_from_page(page, domain)
+        if not entry:
+            continue
+        key = (
+            entry.source_scope,
+            entry.inn,
+            entry.ogrn,
+            entry.ogrnip,
+            entry.phones,
+            entry.emails,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(entry)
+
+    return entries
+
+
 def element_has_specialist_hint(tag: Any) -> bool:
     class_names = " ".join(tag.get("class", []))
     element_id = tag.get("id", "")
@@ -625,6 +822,28 @@ def write_specialists_csv(path: Path, specialists: Iterable[SpecialistEntry]) ->
             )
 
 
+def write_contacts_csv(path: Path, contacts: Iterable[ContactEntry]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=["domain", "source_url", "source_scope", "inn", "ogrn", "ogrnip", "phones", "emails"],
+        )
+        writer.writeheader()
+        for item in contacts:
+            writer.writerow(
+                {
+                    "domain": item.domain,
+                    "source_url": item.source_url,
+                    "source_scope": item.source_scope,
+                    "inn": item.inn,
+                    "ogrn": item.ogrn,
+                    "ogrnip": item.ogrnip,
+                    "phones": item.phones,
+                    "emails": item.emails,
+                }
+            )
+
+
 def build_browser_config() -> Any:
     if BrowserConfig is None:
         return None
@@ -704,6 +923,7 @@ async def crawl_site_pages(
 ) -> list[PageData]:
     normalized_start = normalize_start_url(start_url)
     root_host = normalize_host(urlparse(normalized_start).netloc)
+    origin_domain = extract_origin_domain(root_host)
     queue: deque[str] = deque([normalized_start])
     enqueued: set[str] = {normalized_start}
     visited: set[str] = set()
@@ -741,7 +961,7 @@ async def crawl_site_pages(
                 raw_href = str(link).strip()
                 link_text = ""
 
-            normalized = normalize_internal_url(raw_href, result.url or current_url, root_host)
+            normalized = normalize_internal_url(raw_href, result.url or current_url, origin_domain)
             if not normalized:
                 continue
             if normalized in visited or normalized in enqueued:
@@ -809,19 +1029,21 @@ async def run(urls: list[str], max_pages: int, output_dir: Path, verbose: bool) 
             )
             prices = extract_prices(pages, domain)
             specialists = extract_specialists(pages, domain)
+            contacts = extract_contacts(pages, domain)
 
             write_pricing_csv(site_dir / "pricing.csv", prices)
             write_specialists_csv(site_dir / "specialists.csv", specialists)
+            write_contacts_csv(site_dir / "contacts.csv", contacts)
 
             print(
                 f"[done] {url} | pages={len(pages)} prices={len(prices)} "
-                f"specialists={len(specialists)} -> {site_dir}"
+                f"specialists={len(specialists)} contacts={len(contacts)} -> {site_dir}"
             )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Crawl dental websites with crawl4ai and export pricing/specialists to CSV."
+        description="Crawl dental websites with crawl4ai and export pricing/specialists/contacts to CSV."
     )
     parser.add_argument("--url", action="append", help="Website URL (can be repeated).")
     parser.add_argument("--url-file", help="Path to text file with URLs (one per line).")
