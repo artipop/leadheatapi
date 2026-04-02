@@ -121,11 +121,21 @@ def write_hh_links_csv(rows: list[dict[str, str]], output_csv: Path) -> None:
             writer.writerow(row)
 
 
-def read_firms(csv_path: Path, limit: Optional[int]) -> list[dict[str, str]]:
+def read_firms(
+    csv_path: Path,
+    limit: Optional[int],
+    start_row: int,
+    end_row: Optional[int],
+) -> list[dict[str, str]]:
     firms: list[dict[str, str]] = []
     with csv_path.open("r", encoding="utf-8", newline="") as file:
         reader = csv.DictReader(file)
-        for row in reader:
+        for row_index, row in enumerate(reader, start=1):
+            if row_index < start_row:
+                continue
+            if end_row is not None and row_index > end_row:
+                break
+
             firm_id = (row.get("id") or "").strip()
             if not firm_id:
                 continue
@@ -284,6 +294,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Stream crawl sites from dublgis_items.csv in order.")
     parser.add_argument("--csv", default="dublgis_items.csv", help="Path to 2GIS CSV file.")
     parser.add_argument("--limit", type=int, help="How many first rows to process (default: all).")
+    parser.add_argument("--start-row", type=int, default=1, help="Start row number (1-based, excluding header).")
+    parser.add_argument("--end-row", type=int, help="End row number (1-based, inclusive, excluding header).")
     parser.add_argument("--city-code", default="moscow", help="2GIS city code for firm card URL.")
     parser.add_argument("--max-sites-per-firm", type=int, default=3, help="Max websites to crawl per firm.")
     parser.add_argument("--max-pages", type=int, default=40, help="Max pages per website.")
@@ -305,8 +317,18 @@ def main() -> None:
     if not csv_path.exists():
         raise SystemExit(f"CSV not found: {csv_path}")
 
+    start_row = max(1, args.start_row)
+    end_row = args.end_row
+    if end_row is not None and end_row < start_row:
+        raise SystemExit("--end-row must be greater than or equal to --start-row")
+
     limit = max(1, args.limit) if args.limit is not None else None
-    firms = read_firms(csv_path=csv_path, limit=limit)
+    firms = read_firms(
+        csv_path=csv_path,
+        limit=limit,
+        start_row=start_row,
+        end_row=end_row,
+    )
     if not firms:
         raise SystemExit("No firms with id found in CSV")
 
