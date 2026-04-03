@@ -5,6 +5,7 @@ import asyncio
 import csv
 import logging
 from pathlib import Path
+from typing import Iterable
 from typing import Optional
 from urllib.error import HTTPError
 from urllib.error import URLError
@@ -35,6 +36,41 @@ RESOLVE_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/136.0.0.0 Safari/537.36"
 )
+HH_LINKS_FIELDNAMES = ("firm_id", "company_name", "address_name", "site_url", "hh_employer_url", "source")
+TELEGRAM_FIELDNAMES = ("firm_id", "company_name", "address_name", "site_url", "telegram_url", "source")
+MAX_FIELDNAMES = ("firm_id", "company_name", "address_name", "site_url", "max_channel_url", "source")
+DZEN_FIELDNAMES = ("firm_id", "company_name", "address_name", "site_url", "dzen_url", "source")
+RUTUBE_FIELDNAMES = ("firm_id", "company_name", "address_name", "site_url", "link_url", "link_host", "source")
+VK_FIELDNAMES = ("firm_id", "company_name", "address_name", "site_url", "link_url", "link_host", "source")
+OTHER_LINKS_FIELDNAMES = ("firm_id", "company_name", "address_name", "site_url", "link_url", "link_host", "source")
+VIDEO_HOST_DOMAINS = {
+    "rutube.ru",
+    "youtube.com",
+    "youtu.be",
+    "vimeo.com",
+    "dailymotion.com",
+    "twitch.tv",
+    "video.mail.ru",
+    "smotrim.ru",
+}
+SOCIAL_HOST_DOMAINS = {
+    "vk.com",
+    "vkontakte.ru",
+    "ok.ru",
+    "instagram.com",
+    "facebook.com",
+    "fb.com",
+    "x.com",
+    "twitter.com",
+    "linkedin.com",
+    "pinterest.com",
+    "tiktok.com",
+    "threads.net",
+    "t.me",
+    "telegram.me",
+    "max.ru",
+    "dzen.ru",
+}
 
 
 def normalize_site_url(url: str) -> Optional[str]:
@@ -47,13 +83,14 @@ def normalize_site_url(url: str) -> Optional[str]:
     parsed = urlsplit(value)
     if parsed.scheme not in {"http", "https"}:
         return None
-    host = (parsed.hostname or "").lower()
+    host = normalize_host_for_url(parsed.hostname or "")
     if not host:
         return None
-    if host.startswith("www."):
-        host = host[4:]
 
-    port = parsed.port
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
     netloc = host
     if port and not ((parsed.scheme == "http" and port == 80) or (parsed.scheme == "https" and port == 443)):
         netloc = f"{host}:{port}"
@@ -66,6 +103,32 @@ def normalize_site_url(url: str) -> Optional[str]:
     return urlunsplit((scheme, netloc, path, "", ""))
 
 
+def normalize_site_origin_url(url: str) -> Optional[str]:
+    value = url.strip()
+    if not value:
+        return None
+    if "://" not in value:
+        value = f"https://{value}"
+
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    host = normalize_host_for_url(parsed.hostname or "")
+    if not host:
+        return None
+
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    netloc = host
+    if port and not ((parsed.scheme == "http" and port == 80) or (parsed.scheme == "https" and port == 443)):
+        netloc = f"{host}:{port}"
+
+    scheme = "https" if parsed.scheme in {"http", "https"} and port in {None, 80, 443} else parsed.scheme
+    return urlunsplit((scheme, netloc, "/", "", ""))
+
+
 def split_http_like_url(url: str) -> SplitResult:
     value = url.strip()
     if not value:
@@ -75,10 +138,49 @@ def split_http_like_url(url: str) -> SplitResult:
     return urlsplit(value)
 
 
-def is_hh_host(host: str) -> bool:
-    value = host.lower()
+def normalize_host_for_url(host: str) -> str:
+    value = host.strip().lower()
     if value.startswith("www."):
         value = value[4:]
+    if not value:
+        return ""
+    try:
+        return value.encode("idna").decode("ascii")
+    except UnicodeError:
+        return value
+
+
+def decode_host_from_idna(host: str) -> str:
+    value = host.strip().lower()
+    if not value:
+        return ""
+    try:
+        decoded = value.encode("ascii").decode("idna")
+    except UnicodeError:
+        decoded = value
+    return decoded
+
+
+def to_display_url(url: str) -> str:
+    parsed = split_http_like_url(url)
+    host = decode_host_from_idna(parsed.hostname or "")
+    if not host:
+        return url
+
+    netloc = host
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port:
+        netloc = f"{host}:{port}"
+    path = parsed.path or "/"
+    scheme = parsed.scheme or "https"
+    return urlunsplit((scheme, netloc, path, parsed.query, ""))
+
+
+def is_hh_host(host: str) -> bool:
+    value = normalize_host_for_url(host)
     return value == "hh.ru" or value.endswith(".hh.ru")
 
 
@@ -87,16 +189,12 @@ def is_hh_url(url: str) -> bool:
 
 
 def is_telegram_host(host: str) -> bool:
-    value = host.lower()
-    if value.startswith("www."):
-        value = value[4:]
+    value = normalize_host_for_url(host)
     return value in {"t.me", "telegram.me"}
 
 
 def is_jivo_host(host: str) -> bool:
-    value = host.lower()
-    if value.startswith("www."):
-        value = value[4:]
+    value = normalize_host_for_url(host)
     return value == "jivo.chat" or value.endswith(".jivo.chat")
 
 
@@ -105,9 +203,7 @@ def is_jivo_url(url: str) -> bool:
 
 
 def is_clck_host(host: str) -> bool:
-    value = host.lower()
-    if value.startswith("www."):
-        value = value[4:]
+    value = normalize_host_for_url(host)
     return value == "clck.ru" or value.endswith(".clck.ru")
 
 
@@ -116,14 +212,40 @@ def is_clck_url(url: str) -> bool:
 
 
 def is_max_host(host: str) -> bool:
-    value = host.lower()
-    if value.startswith("www."):
-        value = value[4:]
+    value = normalize_host_for_url(host)
     return value == "max.ru" or value.endswith(".max.ru")
 
 
 def is_max_url(url: str) -> bool:
     return is_max_host(split_http_like_url(url).hostname or "")
+
+
+def is_dzen_host(host: str) -> bool:
+    value = normalize_host_for_url(host)
+    return (
+        value == "dzen.ru"
+        or value.endswith(".dzen.ru")
+    )
+
+
+def is_dzen_url(url: str) -> bool:
+    return is_dzen_host(split_http_like_url(url).hostname or "")
+
+
+def host_matches_domain_list(host: str, domains: set[str]) -> bool:
+    normalized = normalize_host_for_url(host)
+    if not normalized:
+        return False
+    return any(normalized == domain or normalized.endswith(f".{domain}") for domain in domains)
+
+
+def classify_platform_url(url: str) -> Optional[str]:
+    host = split_http_like_url(url).hostname or ""
+    if host_matches_domain_list(host, VIDEO_HOST_DOMAINS):
+        return "video_hosting"
+    if host_matches_domain_list(host, SOCIAL_HOST_DOMAINS):
+        return "social_network"
+    return None
 
 
 def normalize_http_url(url: str) -> Optional[str]:
@@ -132,15 +254,17 @@ def normalize_http_url(url: str) -> Optional[str]:
     if parsed.scheme not in {"http", "https"}:
         return None
 
-    host = (parsed.hostname or "").lower()
+    host = normalize_host_for_url(parsed.hostname or "")
     if not host:
         return None
-    if host.startswith("www."):
-        host = host[4:]
 
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
     netloc = host
-    if parsed.port and not ((parsed.scheme == "http" and parsed.port == 80) or (parsed.scheme == "https" and parsed.port == 443)):
-        netloc = f"{host}:{parsed.port}"
+    if port and not ((parsed.scheme == "http" and port == 80) or (parsed.scheme == "https" and port == 443)):
+        netloc = f"{host}:{port}"
 
     path = parsed.path or "/"
     if len(path) > 1:
@@ -170,10 +294,24 @@ def resolve_short_url(url: str, timeout_seconds: int = 15) -> Optional[str]:
     return normalized
 
 
+def resolve_site_redirect(url: str, timeout_seconds: int = 15) -> Optional[str]:
+    normalized_input = normalize_site_origin_url(url)
+    if not normalized_input:
+        return None
+
+    request = Request(normalized_input, headers={"User-Agent": RESOLVE_USER_AGENT})
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            final_url = response.geturl()
+    except (HTTPError, URLError, TimeoutError, ValueError):
+        return normalized_input
+
+    normalized_final = normalize_site_origin_url(final_url)
+    return normalized_final or normalized_input
+
+
 def extract_origin_domain(host: str) -> str:
-    normalized = host.lower()
-    if normalized.startswith("www."):
-        normalized = normalized[4:]
+    normalized = normalize_host_for_url(host)
     parts = [part for part in normalized.split(".") if part]
     if len(parts) <= 2:
         return normalized
@@ -184,15 +322,11 @@ def extract_origin_domain(host: str) -> str:
 
 def is_internal_for_site(url: str, site_url: str) -> bool:
     parsed = urlsplit(url)
-    host = (parsed.hostname or "").lower()
+    host = normalize_host_for_url(parsed.hostname or "")
     if not host:
         return False
-    if host.startswith("www."):
-        host = host[4:]
 
-    site_host = (urlsplit(site_url).hostname or "").lower()
-    if site_host.startswith("www."):
-        site_host = site_host[4:]
+    site_host = normalize_host_for_url(urlsplit(site_url).hostname or "")
     if not site_host:
         return False
 
@@ -201,16 +335,14 @@ def is_internal_for_site(url: str, site_url: str) -> bool:
 
 
 def origin_domain_from_url(url: str) -> str:
-    host = (urlsplit(url).hostname or "").lower()
-    if host.startswith("www."):
-        host = host[4:]
+    host = normalize_host_for_url(urlsplit(url).hostname or "")
     return extract_origin_domain(host) if host else ""
 
 
 def normalize_hh_employer_url(url: str) -> Optional[str]:
     resolved, _ = urldefrag(url)
     parsed = split_http_like_url(resolved)
-    host = (parsed.hostname or "").lower()
+    host = normalize_host_for_url(parsed.hostname or "")
     if not is_hh_host(host):
         return None
 
@@ -218,8 +350,6 @@ def normalize_hh_employer_url(url: str) -> Optional[str]:
     if not path.startswith("/employer"):
         return None
 
-    if host.startswith("www."):
-        host = host[4:]
     query_pairs = [
         (key, value)
         for key, value in parse_qsl(parsed.query, keep_blank_values=True)
@@ -232,11 +362,9 @@ def normalize_hh_employer_url(url: str) -> Optional[str]:
 def normalize_telegram_url(url: str) -> Optional[str]:
     resolved, _ = urldefrag(url)
     parsed = split_http_like_url(resolved)
-    host = (parsed.hostname or "").lower()
+    host = normalize_host_for_url(parsed.hostname or "")
     if not is_telegram_host(host):
         return None
-    if host.startswith("www."):
-        host = host[4:]
     path = (parsed.path or "").rstrip("/")
     if not path:
         return None
@@ -246,11 +374,9 @@ def normalize_telegram_url(url: str) -> Optional[str]:
 def normalize_max_channel_url(url: str) -> Optional[str]:
     resolved, _ = urldefrag(url)
     parsed = split_http_like_url(resolved)
-    host = (parsed.hostname or "").lower()
+    host = normalize_host_for_url(parsed.hostname or "")
     if not is_max_host(host):
         return None
-    if host.startswith("www."):
-        host = host[4:]
 
     path = (parsed.path or "").rstrip("/")
     if not path:
@@ -265,8 +391,31 @@ def normalize_max_channel_url(url: str) -> Optional[str]:
     return urlunsplit(("https", host, path, parsed.query, ""))
 
 
-def extract_page_links(pages) -> list[str]:
-    found: list[str] = []
+def normalize_dzen_url(url: str) -> Optional[str]:
+    resolved, _ = urldefrag(url)
+    parsed = split_http_like_url(resolved)
+    host = normalize_host_for_url(parsed.hostname or "")
+    if not is_dzen_host(host):
+        return None
+    path = (parsed.path or "").rstrip("/")
+    if not path:
+        return None
+    return urlunsplit(("https", host, path, parsed.query, ""))
+
+
+def has_invalid_http_port(url: str) -> bool:
+    parsed = urlsplit(url.strip())
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    try:
+        _ = parsed.port
+    except ValueError:
+        return True
+    return False
+
+
+def extract_page_links(pages) -> list[tuple[str, str]]:
+    found: list[tuple[str, str]] = []
     seen: set[str] = set()
 
     for page in pages:
@@ -279,85 +428,41 @@ def extract_page_links(pages) -> list[str]:
             if resolved in seen:
                 continue
             seen.add(resolved)
-            found.append(resolved)
+            found.append((page.url, resolved))
     return found
 
 
-def write_hh_links_csv(rows: list[dict[str, str]], output_csv: Path) -> None:
+def append_csv_rows(output_csv: Path, fieldnames: tuple[str, ...], rows: Iterable[dict[str, str]]) -> int:
+    prepared_rows = list(rows)
+    if not prepared_rows:
+        return 0
+
     output_csv.parent.mkdir(parents=True, exist_ok=True)
-    with output_csv.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=[
-                "firm_id",
-                "company_name",
-                "address_name",
-                "site_url",
-                "hh_employer_url",
-                "source",
-            ],
-        )
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+    write_header = not output_csv.exists() or output_csv.stat().st_size == 0
+
+    with output_csv.open("a", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=list(fieldnames))
+        if write_header:
+            writer.writeheader()
+        for row in prepared_rows:
+            writer.writerow({name: row.get(name, "") for name in fieldnames})
+    return len(prepared_rows)
 
 
-def write_telegram_links_csv(rows: list[dict[str, str]], output_csv: Path) -> None:
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    with output_csv.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=[
-                "firm_id",
-                "company_name",
-                "address_name",
-                "site_url",
-                "telegram_url",
-                "source",
-            ],
-        )
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+def load_seen_pairs(csv_path: Path, left_field: str, right_field: str) -> set[tuple[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return seen
 
-
-def write_max_channels_csv(rows: list[dict[str, str]], output_csv: Path) -> None:
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    with output_csv.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=[
-                "firm_id",
-                "company_name",
-                "address_name",
-                "site_url",
-                "max_channel_url",
-                "source",
-            ],
-        )
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-
-
-def write_other_links_csv(rows: list[dict[str, str]], output_csv: Path) -> None:
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    with output_csv.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=[
-                "firm_id",
-                "company_name",
-                "address_name",
-                "site_url",
-                "link_url",
-                "link_host",
-                "source",
-            ],
-        )
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+    with csv_path.open("r", encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            left = (row.get(left_field) or "").strip()
+            right = (row.get(right_field) or "").strip()
+            if not left or not right:
+                continue
+            seen.add((left, right))
+    return seen
 
 
 def read_firms(
@@ -399,6 +504,9 @@ async def run_streaming(
     hh_links_csv: Path,
     telegram_csv: Path,
     max_channels_csv: Path,
+    dzen_csv: Path,
+    rutube_csv: Path,
+    vk_csv: Path,
     other_links_csv: Path,
     verbose: bool,
 ) -> None:
@@ -407,16 +515,23 @@ async def run_streaming(
     run_config = build_run_config()
 
     failed_attempts: list[str] = []
-    hh_rows: list[dict[str, str]] = []
-    telegram_rows: list[dict[str, str]] = []
-    max_rows: list[dict[str, str]] = []
-    other_links_rows: list[dict[str, str]] = []
-    seen_hh: set[tuple[str, str]] = set()
-    seen_telegram: set[tuple[str, str]] = set()
-    seen_max: set[tuple[str, str]] = set()
-    seen_other: set[tuple[str, str]] = set()
+    seen_hh = load_seen_pairs(hh_links_csv, "firm_id", "hh_employer_url")
+    seen_telegram = load_seen_pairs(telegram_csv, "firm_id", "telegram_url")
+    seen_max = load_seen_pairs(max_channels_csv, "firm_id", "max_channel_url")
+    seen_dzen = load_seen_pairs(dzen_csv, "firm_id", "dzen_url")
+    seen_rutube = load_seen_pairs(rutube_csv, "firm_id", "link_url")
+    seen_vk = load_seen_pairs(vk_csv, "firm_id", "link_url")
+    seen_other = load_seen_pairs(other_links_csv, "firm_id", "link_url")
     seen_crawled_origins: set[str] = set()
     short_url_cache: dict[str, Optional[str]] = {}
+    site_redirect_cache: dict[str, Optional[str]] = {}
+    appended_hh_rows = 0
+    appended_telegram_rows = 0
+    appended_max_rows = 0
+    appended_dzen_rows = 0
+    appended_rutube_rows = 0
+    appended_vk_rows = 0
+    appended_other_rows = 0
 
     def resolve_short_url_cached(raw_url: str) -> Optional[str]:
         key = raw_url.strip()
@@ -426,6 +541,110 @@ async def run_streaming(
         resolved = resolve_short_url(key)
         short_url_cache[key] = resolved
         return resolved
+
+    def resolve_site_redirect_cached(raw_url: str) -> Optional[str]:
+        normalized = normalize_site_origin_url(raw_url)
+        if not normalized:
+            return None
+        cached = site_redirect_cache.get(normalized)
+        if cached is not None or normalized in site_redirect_cache:
+            return cached
+        resolved = resolve_site_redirect(normalized)
+        site_redirect_cache[normalized] = resolved
+        return resolved
+
+    def append_hh_row(row: dict[str, str]) -> bool:
+        nonlocal appended_hh_rows
+        key = ((row.get("firm_id") or "").strip(), (row.get("hh_employer_url") or "").strip())
+        if not key[0] or not key[1] or key in seen_hh:
+            return False
+        seen_hh.add(key)
+        appended_hh_rows += append_csv_rows(hh_links_csv, HH_LINKS_FIELDNAMES, [row])
+        return True
+
+    def append_telegram_row(row: dict[str, str]) -> bool:
+        nonlocal appended_telegram_rows
+        key = ((row.get("firm_id") or "").strip(), (row.get("telegram_url") or "").strip())
+        if not key[0] or not key[1] or key in seen_telegram:
+            return False
+        seen_telegram.add(key)
+        appended_telegram_rows += append_csv_rows(telegram_csv, TELEGRAM_FIELDNAMES, [row])
+        return True
+
+    def append_max_row(row: dict[str, str]) -> bool:
+        nonlocal appended_max_rows
+        key = ((row.get("firm_id") or "").strip(), (row.get("max_channel_url") or "").strip())
+        if not key[0] or not key[1] or key in seen_max:
+            return False
+        seen_max.add(key)
+        appended_max_rows += append_csv_rows(max_channels_csv, MAX_FIELDNAMES, [row])
+        return True
+
+    def append_dzen_row(row: dict[str, str]) -> bool:
+        nonlocal appended_dzen_rows
+        key = ((row.get("firm_id") or "").strip(), (row.get("dzen_url") or "").strip())
+        if not key[0] or not key[1] or key in seen_dzen:
+            return False
+        seen_dzen.add(key)
+        appended_dzen_rows += append_csv_rows(dzen_csv, DZEN_FIELDNAMES, [row])
+        return True
+
+    def append_other_row(row: dict[str, str]) -> bool:
+        nonlocal appended_other_rows
+        key = ((row.get("firm_id") or "").strip(), (row.get("link_url") or "").strip())
+        if not key[0] or not key[1] or key in seen_other:
+            return False
+        seen_other.add(key)
+        appended_other_rows += append_csv_rows(other_links_csv, OTHER_LINKS_FIELDNAMES, [row])
+        return True
+
+    def append_rutube_row(row: dict[str, str]) -> bool:
+        nonlocal appended_rutube_rows
+        key = ((row.get("firm_id") or "").strip(), (row.get("link_url") or "").strip())
+        if not key[0] or not key[1] or key in seen_rutube:
+            return False
+        seen_rutube.add(key)
+        appended_rutube_rows += append_csv_rows(rutube_csv, RUTUBE_FIELDNAMES, [row])
+        return True
+
+    def append_vk_row(row: dict[str, str]) -> bool:
+        nonlocal appended_vk_rows
+        key = ((row.get("firm_id") or "").strip(), (row.get("link_url") or "").strip())
+        if not key[0] or not key[1] or key in seen_vk:
+            return False
+        seen_vk.add(key)
+        appended_vk_rows += append_csv_rows(vk_csv, VK_FIELDNAMES, [row])
+        return True
+
+    def append_platform_link(
+        *,
+        firm_id_value: str,
+        company_name_value: str,
+        address_name_value: str,
+        site_url_value: str,
+        link_url_value: str,
+        source_value: str,
+        platform_kind: str,
+    ) -> bool:
+        normalized_link = normalize_http_url(link_url_value)
+        if not normalized_link:
+            return False
+        host = normalize_host_for_url(urlsplit(normalized_link).hostname or "")
+        base_row = {
+            "firm_id": firm_id_value,
+            "company_name": company_name_value,
+            "address_name": address_name_value,
+            "site_url": site_url_value,
+            "link_url": normalized_link,
+            "link_host": host,
+            "source": f"{source_value}_{platform_kind}",
+        }
+        if platform_kind == "video_hosting":
+            inserted = append_rutube_row(base_row)
+        else:
+            inserted = append_vk_row(base_row)
+        append_other_row(base_row)
+        return inserted
 
     async with create_crawler(browser_config) as crawler:
         for index, firm in enumerate(firms, start=1):
@@ -454,86 +673,213 @@ async def run_streaming(
                 if is_clck_url(raw_site):
                     resolved = resolve_short_url_cached(raw_site)
                     if not resolved:
-                        logger.info("Skip unresolved clck.ru link from 2GIS card for firm_id=%s: %s", firm_id, raw_site)
+                        logger.info(
+                            "Skip unresolved clck.ru link from 2GIS card for firm_id=%s: %s",
+                            firm_id,
+                            to_display_url(raw_site),
+                        )
                         continue
-                    logger.info("Resolved clck.ru from 2GIS card: %s -> %s", raw_site, resolved)
+                    logger.info(
+                        "Resolved clck.ru from 2GIS card: %s -> %s",
+                        to_display_url(raw_site),
+                        to_display_url(resolved),
+                    )
                     processed_site = resolved
 
                 if is_jivo_url(processed_site):
-                    logger.info("Skip jivo.chat link from 2GIS card for firm_id=%s: %s", firm_id, processed_site)
+                    logger.info(
+                        "Skip jivo.chat link from 2GIS card for firm_id=%s: %s",
+                        firm_id,
+                        to_display_url(processed_site),
+                    )
+                    continue
+
+                platform_kind = classify_platform_url(processed_site)
+                if platform_kind is not None:
+                    append_platform_link(
+                        firm_id_value=firm_id,
+                        company_name_value=company_name,
+                        address_name_value=address_name,
+                        site_url_value="",
+                        link_url_value=processed_site,
+                        source_value="2gis_card",
+                        platform_kind=platform_kind,
+                    )
                     continue
 
                 if is_max_url(processed_site):
                     max_url = normalize_max_channel_url(processed_site)
                     if max_url:
-                        key = (firm_id, max_url)
-                        if key not in seen_max:
-                            seen_max.add(key)
-                            max_rows.append(
-                                {
-                                    "firm_id": firm_id,
-                                    "company_name": company_name,
-                                    "address_name": address_name,
-                                    "site_url": "",
-                                    "max_channel_url": max_url,
-                                    "source": "2gis_card",
-                                }
-                            )
-                    else:
-                        logger.info("Skip max.ru link from 2GIS card for firm_id=%s: %s", firm_id, processed_site)
-                    continue
-
-                if is_hh_url(processed_site):
-                    hh_url = normalize_hh_employer_url(processed_site)
-                    if hh_url:
-                        key = (firm_id, hh_url)
-                        if key not in seen_hh:
-                            seen_hh.add(key)
-                            hh_rows.append(
-                                {
-                                    "firm_id": firm_id,
-                                    "company_name": company_name,
-                                    "address_name": address_name,
-                                    "site_url": "",
-                                    "hh_employer_url": hh_url,
-                                    "source": "2gis_card",
-                                }
-                            )
-                    continue
-
-                telegram_url = normalize_telegram_url(processed_site)
-                if telegram_url:
-                    key = (firm_id, telegram_url)
-                    if key not in seen_telegram:
-                        seen_telegram.add(key)
-                        telegram_rows.append(
+                        append_max_row(
                             {
                                 "firm_id": firm_id,
                                 "company_name": company_name,
                                 "address_name": address_name,
                                 "site_url": "",
-                                "telegram_url": telegram_url,
+                                "max_channel_url": max_url,
+                                "source": "2gis_card",
+                            }
+                        )
+                    else:
+                        logger.info(
+                            "Skip max.ru link from 2GIS card for firm_id=%s: %s",
+                            firm_id,
+                            to_display_url(processed_site),
+                        )
+                    continue
+
+                if is_hh_url(processed_site):
+                    hh_url = normalize_hh_employer_url(processed_site)
+                    if hh_url:
+                        append_hh_row(
+                            {
+                                "firm_id": firm_id,
+                                "company_name": company_name,
+                                "address_name": address_name,
+                                "site_url": "",
+                                "hh_employer_url": hh_url,
                                 "source": "2gis_card",
                             }
                         )
                     continue
 
-                normalized = normalize_site_url(processed_site)
+                telegram_url = normalize_telegram_url(processed_site)
+                if telegram_url:
+                    append_telegram_row(
+                        {
+                            "firm_id": firm_id,
+                            "company_name": company_name,
+                            "address_name": address_name,
+                            "site_url": "",
+                            "telegram_url": telegram_url,
+                            "source": "2gis_card",
+                        }
+                    )
+                    continue
+
+                dzen_url = normalize_dzen_url(processed_site)
+                if dzen_url:
+                    append_dzen_row(
+                        {
+                            "firm_id": firm_id,
+                            "company_name": company_name,
+                            "address_name": address_name,
+                            "site_url": "",
+                            "dzen_url": dzen_url,
+                            "source": "2gis_card",
+                        }
+                    )
+                    continue
+
+                normalized = normalize_site_origin_url(processed_site)
                 if not normalized:
                     continue
-                if normalized in seen_in_firm:
+                resolved_site = resolve_site_redirect_cached(normalized) or normalized
+                if resolved_site != normalized:
+                    logger.info(
+                        "Merged site by redirect for firm_id=%s: %s -> %s",
+                        firm_id,
+                        to_display_url(normalized),
+                        to_display_url(resolved_site),
+                    )
+
+                platform_kind = classify_platform_url(resolved_site)
+                if platform_kind is not None:
+                    append_platform_link(
+                        firm_id_value=firm_id,
+                        company_name_value=company_name,
+                        address_name_value=address_name,
+                        site_url_value="",
+                        link_url_value=resolved_site,
+                        source_value="2gis_card_redirect",
+                        platform_kind=platform_kind,
+                    )
                     continue
-                seen_in_firm.add(normalized)
-                normalized_sites.append(normalized)
+
+                if is_max_url(resolved_site):
+                    max_url = normalize_max_channel_url(resolved_site)
+                    if max_url:
+                        append_max_row(
+                            {
+                                "firm_id": firm_id,
+                                "company_name": company_name,
+                                "address_name": address_name,
+                                "site_url": "",
+                                "max_channel_url": max_url,
+                                "source": "2gis_card_redirect",
+                            }
+                        )
+                    continue
+                if is_hh_url(resolved_site):
+                    hh_url = normalize_hh_employer_url(resolved_site)
+                    if hh_url:
+                        append_hh_row(
+                            {
+                                "firm_id": firm_id,
+                                "company_name": company_name,
+                                "address_name": address_name,
+                                "site_url": "",
+                                "hh_employer_url": hh_url,
+                                "source": "2gis_card_redirect",
+                            }
+                        )
+                    continue
+                telegram_url = normalize_telegram_url(resolved_site)
+                if telegram_url:
+                    append_telegram_row(
+                        {
+                            "firm_id": firm_id,
+                            "company_name": company_name,
+                            "address_name": address_name,
+                            "site_url": "",
+                            "telegram_url": telegram_url,
+                            "source": "2gis_card_redirect",
+                        }
+                    )
+                    continue
+                dzen_url = normalize_dzen_url(resolved_site)
+                if dzen_url:
+                    append_dzen_row(
+                        {
+                            "firm_id": firm_id,
+                            "company_name": company_name,
+                            "address_name": address_name,
+                            "site_url": "",
+                            "dzen_url": dzen_url,
+                            "source": "2gis_card_redirect",
+                        }
+                    )
+                    continue
+
+                if resolved_site in seen_in_firm:
+                    continue
+                seen_in_firm.add(resolved_site)
+                normalized_sites.append(resolved_site)
 
             selected_sites = normalized_sites[: max(1, max_sites_per_firm)]
-            logger.info("Resolved %s raw site(s), selected for crawl: %s", len(sites), selected_sites)
+            logger.info(
+                "Resolved %s raw site(s), selected for crawl: %s",
+                len(sites),
+                [to_display_url(site) for site in selected_sites],
+            )
 
             for site_url in selected_sites:
                 if is_hh_url(site_url):
                     continue
+                platform_kind = classify_platform_url(site_url)
+                if platform_kind is not None:
+                    logger.info(
+                        "Skip %s site crawl for firm_id=%s: %s",
+                        platform_kind,
+                        firm_id,
+                        to_display_url(site_url),
+                    )
+                    continue
                 if is_max_url(site_url):
-                    logger.info("Skip max.ru site crawl for firm_id=%s: %s", firm_id, site_url)
+                    logger.info("Skip max.ru site crawl for firm_id=%s: %s", firm_id, to_display_url(site_url))
+                    continue
+                if is_dzen_url(site_url):
+                    logger.info("Skip dzen site crawl for firm_id=%s: %s", firm_id, to_display_url(site_url))
                     continue
 
                 origin_domain = origin_domain_from_url(site_url)
@@ -541,8 +887,8 @@ async def run_streaming(
                     logger.info(
                         "Skip duplicate origin domain crawl for firm_id=%s: %s (origin=%s)",
                         firm_id,
-                        site_url,
-                        origin_domain,
+                        to_display_url(site_url),
+                        decode_host_from_idna(origin_domain),
                     )
                     continue
                 if origin_domain:
@@ -557,13 +903,13 @@ async def run_streaming(
                         verbose=verbose,
                     )
                 except Exception as exc:
-                    logger.exception("Crawler failed for site=%s: %s", site_url, exc)
-                    failed_attempts.append(site_url)
+                    logger.exception("Crawler failed for site=%s: %s", to_display_url(site_url), exc)
+                    failed_attempts.append(to_display_url(site_url))
                     continue
 
                 if not pages:
-                    logger.warning("No pages collected for site=%s", site_url)
-                    failed_attempts.append(site_url)
+                    logger.warning("No pages collected for site=%s", to_display_url(site_url))
+                    failed_attempts.append(to_display_url(site_url))
                     continue
 
                 domain = domain_slug(site_url)
@@ -580,28 +926,53 @@ async def run_streaming(
                 extracted_hh_count = 0
                 extracted_telegram_count = 0
                 extracted_max_count = 0
+                extracted_dzen_count = 0
                 extracted_other_count = 0
-                for link in extract_page_links(pages):
+                for source_page_url, link in extract_page_links(pages):
                     processed_link = link
                     if is_clck_url(link):
                         resolved = resolve_short_url_cached(link)
                         if not resolved:
-                            logger.info("Skip unresolved clck.ru link from site crawl: %s", link)
+                            logger.info("Skip unresolved clck.ru link from site crawl: %s", to_display_url(link))
                             continue
-                        logger.info("Resolved clck.ru from site crawl: %s -> %s", link, resolved)
+                        logger.info(
+                            "Resolved clck.ru from site crawl: %s -> %s",
+                            to_display_url(link),
+                            to_display_url(resolved),
+                        )
                         processed_link = resolved
 
                     if is_jivo_url(processed_link):
-                        logger.info("Skip jivo.chat link from site crawl: %s", processed_link)
+                        logger.info("Skip jivo.chat link from site crawl: %s", to_display_url(processed_link))
+                        continue
+
+                    if has_invalid_http_port(processed_link):
+                        logger.warning(
+                            "Skip malformed link with invalid port: firm_id=%s site=%s source_page=%s link=%s raw_link=%s",
+                            firm_id,
+                            to_display_url(site_url),
+                            to_display_url(source_page_url),
+                            to_display_url(processed_link),
+                            processed_link,
+                        )
+                        continue
+
+                    platform_kind = classify_platform_url(processed_link)
+                    if platform_kind is not None:
+                        append_platform_link(
+                            firm_id_value=firm_id,
+                            company_name_value=company_name,
+                            address_name_value=address_name,
+                            site_url_value=site_url,
+                            link_url_value=processed_link,
+                            source_value="site_crawl",
+                            platform_kind=platform_kind,
+                        )
                         continue
 
                     hh_url = normalize_hh_employer_url(processed_link)
                     if hh_url:
-                        key = (firm_id, hh_url)
-                        if key in seen_hh:
-                            continue
-                        seen_hh.add(key)
-                        hh_rows.append(
+                        if append_hh_row(
                             {
                                 "firm_id": firm_id,
                                 "company_name": company_name,
@@ -610,17 +981,13 @@ async def run_streaming(
                                 "hh_employer_url": hh_url,
                                 "source": "site_crawl",
                             }
-                        )
-                        extracted_hh_count += 1
+                        ):
+                            extracted_hh_count += 1
                         continue
 
                     max_url = normalize_max_channel_url(processed_link)
                     if max_url:
-                        key = (firm_id, max_url)
-                        if key in seen_max:
-                            continue
-                        seen_max.add(key)
-                        max_rows.append(
+                        if append_max_row(
                             {
                                 "firm_id": firm_id,
                                 "company_name": company_name,
@@ -629,17 +996,13 @@ async def run_streaming(
                                 "max_channel_url": max_url,
                                 "source": "site_crawl",
                             }
-                        )
-                        extracted_max_count += 1
+                        ):
+                            extracted_max_count += 1
                         continue
 
                     telegram_url = normalize_telegram_url(processed_link)
                     if telegram_url:
-                        key = (firm_id, telegram_url)
-                        if key in seen_telegram:
-                            continue
-                        seen_telegram.add(key)
-                        telegram_rows.append(
+                        if append_telegram_row(
                             {
                                 "firm_id": firm_id,
                                 "company_name": company_name,
@@ -648,8 +1011,23 @@ async def run_streaming(
                                 "telegram_url": telegram_url,
                                 "source": "site_crawl",
                             }
-                        )
-                        extracted_telegram_count += 1
+                        ):
+                            extracted_telegram_count += 1
+                        continue
+
+                    dzen_url = normalize_dzen_url(processed_link)
+                    if dzen_url:
+                        if append_dzen_row(
+                            {
+                                "firm_id": firm_id,
+                                "company_name": company_name,
+                                "address_name": address_name,
+                                "site_url": site_url,
+                                "dzen_url": dzen_url,
+                                "source": "site_crawl",
+                            }
+                        ):
+                            extracted_dzen_count += 1
                         continue
 
                     normalized_link = normalize_http_url(processed_link)
@@ -658,31 +1036,22 @@ async def run_streaming(
                     if is_internal_for_site(normalized_link, site_url):
                         continue
 
-                    key = (firm_id, normalized_link)
-                    if key in seen_other:
-                        continue
-                    seen_other.add(key)
-                    other_links_rows.append(
+                    if append_other_row(
                         {
                             "firm_id": firm_id,
                             "company_name": company_name,
                             "address_name": address_name,
                             "site_url": site_url,
                             "link_url": normalized_link,
-                            "link_host": (urlsplit(normalized_link).hostname or "").lower(),
+                            "link_host": normalize_host_for_url(urlsplit(normalized_link).hostname or ""),
                             "source": "site_crawl",
                         }
-                    )
-                    extracted_other_count += 1
-
-                write_hh_links_csv(hh_rows, hh_links_csv)
-                write_telegram_links_csv(telegram_rows, telegram_csv)
-                write_max_channels_csv(max_rows, max_channels_csv)
-                write_other_links_csv(other_links_rows, other_links_csv)
+                    ):
+                        extracted_other_count += 1
 
                 logger.info(
-                    "SUCCESS: %s | pages=%s prices=%s specialists=%s contacts=%s hh_employer_links=%s telegram_links=%s max_channels=%s other_links=%s -> %s",
-                    site_url,
+                    "SUCCESS: %s | pages=%s prices=%s specialists=%s contacts=%s hh_employer_links=%s telegram_links=%s max_channels=%s dzen_links=%s other_links=%s -> %s",
+                    to_display_url(site_url),
                     len(pages),
                     len(prices),
                     len(specialists),
@@ -690,18 +1059,27 @@ async def run_streaming(
                     extracted_hh_count,
                     extracted_telegram_count,
                     extracted_max_count,
+                    extracted_dzen_count,
                     extracted_other_count,
                     site_dir,
                 )
-
-    write_hh_links_csv(hh_rows, hh_links_csv)
-    write_telegram_links_csv(telegram_rows, telegram_csv)
-    write_max_channels_csv(max_rows, max_channels_csv)
-    write_other_links_csv(other_links_rows, other_links_csv)
-    logger.info("Saved hh employer links: %s rows -> %s", len(hh_rows), hh_links_csv)
-    logger.info("Saved telegram links: %s rows -> %s", len(telegram_rows), telegram_csv)
-    logger.info("Saved max channel links: %s rows -> %s", len(max_rows), max_channels_csv)
-    logger.info("Saved other links: %s rows -> %s", len(other_links_rows), other_links_csv)
+    logger.info(
+        "Appended rows this run -> hh:%s telegram:%s max:%s dzen:%s vk:%s rutube:%s other:%s",
+        appended_hh_rows,
+        appended_telegram_rows,
+        appended_max_rows,
+        appended_dzen_rows,
+        appended_vk_rows,
+        appended_rutube_rows,
+        appended_other_rows,
+    )
+    logger.info("HH links CSV: %s", hh_links_csv)
+    logger.info("Telegram links CSV: %s", telegram_csv)
+    logger.info("Max channel links CSV: %s", max_channels_csv)
+    logger.info("Dzen links CSV: %s", dzen_csv)
+    logger.info("VK/social links CSV: %s", vk_csv)
+    logger.info("Rutube/video links CSV: %s", rutube_csv)
+    logger.info("Other links CSV: %s", other_links_csv)
 
     if failed_attempts:
         print("\nFailed attempts:")
@@ -735,6 +1113,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-channels-csv",
         default="output/max_channels.csv",
         help="CSV file for found max channel links.",
+    )
+    parser.add_argument(
+        "--dzen-csv",
+        default="output/dzen.csv",
+        help="CSV file for found dzen links.",
+    )
+    parser.add_argument(
+        "--rutube-csv",
+        default="output/rutube.csv",
+        help="CSV file for video hosting links (rutube and similar).",
+    )
+    parser.add_argument(
+        "--vk-csv",
+        default="output/vk.csv",
+        help="CSV file for social network links (vk and similar).",
     )
     parser.add_argument(
         "--other-links-csv",
@@ -778,6 +1171,9 @@ def main() -> None:
             hh_links_csv=Path(args.hh_links_csv),
             telegram_csv=Path(args.telegram_csv),
             max_channels_csv=Path(args.max_channels_csv),
+            dzen_csv=Path(args.dzen_csv),
+            rutube_csv=Path(args.rutube_csv),
+            vk_csv=Path(args.vk_csv),
             other_links_csv=Path(args.other_links_csv),
             verbose=args.verbose,
         )

@@ -245,6 +245,33 @@ def normalize_host(host: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+def decode_idna_host(host: str) -> str:
+    normalized = normalize_host(host)
+    if not normalized:
+        return ""
+    try:
+        return normalized.encode("ascii").decode("idna")
+    except UnicodeError:
+        return normalized
+
+
+def display_url(url: str) -> str:
+    parsed = urlparse(url)
+    host = decode_idna_host(parsed.hostname or "")
+    if not host:
+        return url
+
+    netloc = host
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port:
+        netloc = f"{host}:{port}"
+    path = parsed.path or "/"
+    return f"{parsed.scheme}://{netloc}{path}{('?' + parsed.query) if parsed.query else ''}"
+
+
 def extract_origin_domain(host: str) -> str:
     normalized = normalize_host(host)
     parts = [part for part in normalized.split(".") if part]
@@ -777,8 +804,8 @@ def extract_specialists(pages: Iterable[PageData], domain: str) -> list[Speciali
 
 
 def domain_slug(url: str) -> str:
-    host = normalize_host(urlparse(url).netloc)
-    return re.sub(r"[^a-zA-Z0-9_.-]", "_", host)
+    host = decode_idna_host(urlparse(url).hostname or "")
+    return re.sub(r"[^\w.-]", "_", host, flags=re.UNICODE)
 
 
 def write_pricing_csv(path: Path, prices: Iterable[PriceEntry]) -> None:
@@ -937,12 +964,12 @@ async def crawl_site_pages(
         visited.add(current_url)
 
         if verbose:
-            print(f"[crawl] {current_url}")
+            print(f"[crawl] {display_url(current_url)}")
 
         result = await crawl_page(crawler=crawler, url=current_url, run_config=run_config)
         if not result.success:
             if verbose:
-                print(f"[skip] {current_url} -> {result.error_message}")
+                print(f"[skip] {display_url(current_url)} -> {result.error_message}")
             continue
 
         html = result.cleaned_html or result.html or ""
@@ -1036,7 +1063,7 @@ async def run(urls: list[str], max_pages: int, output_dir: Path, verbose: bool) 
             write_contacts_csv(site_dir / "contacts.csv", contacts)
 
             print(
-                f"[done] {url} | pages={len(pages)} prices={len(prices)} "
+                f"[done] {display_url(url)} | pages={len(pages)} prices={len(prices)} "
                 f"specialists={len(specialists)} contacts={len(contacts)} -> {site_dir}"
             )
 
