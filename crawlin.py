@@ -6,6 +6,7 @@ import csv
 import os
 import re
 from collections import deque
+from collections.abc import AsyncIterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -27,6 +28,14 @@ except ImportError:
         BrowserConfig = None
         CrawlerRunConfig = None
         CacheMode = None
+
+try:
+    from crawl4ai.async_dispatcher import SemaphoreDispatcher
+except ImportError:
+    try:
+        from crawl4ai.dispatcher import SemaphoreDispatcher
+    except ImportError:
+        SemaphoreDispatcher = None
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -945,8 +954,74 @@ async def crawl_page(crawler: Any, url: str, run_config: Any) -> Any:
     return await crawler.arun(url=url)
 
 
+def build_dispatcher(page_concurrency: int) -> Any:
+    if page_concurrency <= 1 or SemaphoreDispatcher is None:
+        return None
+
+    candidates = (
+        {"semaphore_count": page_concurrency, "max_session_permit": max(20, page_concurrency)},
+        {"semaphore_count": page_concurrency},
+        {},
+    )
+    for kwargs in candidates:
+        try:
+            return SemaphoreDispatcher(**kwargs)
+        except TypeError:
+            continue
+    return None
+
+
+async def collect_arun_many_results(results: Any) -> list[Any]:
+    if results is None:
+        return []
+    if isinstance(results, list):
+        return results
+    if isinstance(results, AsyncIterable):
+        collected: list[Any] = []
+        async for item in results:
+            collected.append(item)
+        return collected
+    try:
+        return list(results)
+    except TypeError:
+        return [results]
+
+
+async def crawl_pages_batch(crawler: Any, urls: list[str], run_config: Any, page_concurrency: int) -> list[tuple[str, Any]]:
+    if not urls:
+        return []
+
+    run_many = getattr(crawler, "arun_many", None)
+    dispatcher = build_dispatcher(page_concurrency)
+    if run_many is None or len(urls) <= 1 or page_concurrency <= 1:
+        return [(url, await crawl_page(crawler=crawler, url=url, run_config=run_config)) for url in urls]
+
+    try:
+        if run_config is not None and dispatcher is not None:
+            raw_results = await run_many(urls=urls, config=run_config, dispatcher=dispatcher)
+        elif run_config is not None:
+            raw_results = await run_many(urls=urls, config=run_config)
+        elif dispatcher is not None:
+            raw_results = await run_many(urls=urls, dispatcher=dispatcher)
+        else:
+            raw_results = await run_many(urls=urls)
+        results = await collect_arun_many_results(raw_results)
+    except TypeError:
+        results = [(url, await crawl_page(crawler=crawler, url=url, run_config=run_config)) for url in urls]
+        return results
+
+    paired: list[tuple[str, Any]] = []
+    for index, result in enumerate(results):
+        source_url = urls[index] if index < len(urls) else str(getattr(result, "url", "") or "")
+        paired.append((source_url, result))
+    if len(results) < len(urls):
+        for url in urls[len(results):]:
+            paired.append((url, await crawl_page(crawler=crawler, url=url, run_config=run_config)))
+    return paired
+
+
 async def crawl_site_pages(
-    crawler: Any, start_url: str, max_pages: int, run_config: Any, verbose: bool
+    crawler: Any, start_url: str, max_pages: int, run_config: Any, verbose: bool, page_concurrency: int = 1
 ) -> list[PageData]:
     normalized_start = normalize_start_url(start_url)
     root_host = normalize_host(urlparse(normalized_start).netloc)
@@ -957,55 +1032,73 @@ async def crawl_site_pages(
     pages: list[PageData] = []
 
     while queue and len(visited) < max_pages:
-        current_url = queue.popleft()
-        enqueued.discard(current_url)
-        if current_url in visited:
-            continue
-        visited.add(current_url)
+        batch_size = max(1, page_concurrency)
+        current_batch: list[str] = []
+        while queue and len(current_batch) < batch_size and len(visited) < max_pages:
+            current_url = queue.popleft()
+            enqueued.discard(current_url)
+            if current_url in visited:
+                continue
+            visited.add(current_url)
+            current_batch.append(current_url)
 
+        if not current_batch:
+            continue
         if verbose:
-            print(f"[crawl] {display_url(current_url)}")
+            for batch_url in current_batch:
+                print(f"[crawl] {display_url(batch_url)}")
 
-        result = await crawl_page(crawler=crawler, url=current_url, run_config=run_config)
-        if not result.success:
-            if verbose:
-                print(f"[skip] {display_url(current_url)} -> {result.error_message}")
-            continue
-
-        html = result.cleaned_html or result.html or ""
-        markdown = extract_markdown_text(result.markdown)
-        pages.append(PageData(url=result.url or current_url, title=extract_title(html), html=html, markdown=markdown))
-
-        internal_links = (result.links or {}).get("internal", [])
-        prioritized: list[tuple[int, str]] = []
-        regular: list[str] = []
-
-        for link in internal_links:
-            if isinstance(link, dict):
-                raw_href = str(link.get("href", "")).strip()
-                link_text = str(link.get("text", "")).strip()
-            else:
-                raw_href = str(link).strip()
-                link_text = ""
-
-            normalized = normalize_internal_url(raw_href, result.url or current_url, origin_domain)
-            if not normalized:
+        crawl_results = await crawl_pages_batch(
+            crawler=crawler,
+            urls=current_batch,
+            run_config=run_config,
+            page_concurrency=page_concurrency,
+        )
+        for requested_url, result in crawl_results:
+            if isinstance(result, Exception):
+                if verbose:
+                    print(f"[skip] {display_url(requested_url)} -> {result}")
                 continue
-            if normalized in visited or normalized in enqueued:
+            if not result.success:
+                if verbose:
+                    print(f"[skip] {display_url(requested_url)} -> {result.error_message}")
                 continue
 
-            priority = link_priority(normalized, link_text)
-            if priority > 0:
-                prioritized.append((priority, normalized))
-            else:
-                regular.append(normalized)
+            effective_url = result.url or requested_url
+            html = result.cleaned_html or result.html or ""
+            markdown = extract_markdown_text(result.markdown)
+            pages.append(PageData(url=effective_url, title=extract_title(html), html=html, markdown=markdown))
 
-        for _, url in sorted(prioritized, key=lambda item: item[0]):
-            queue.appendleft(url)
-            enqueued.add(url)
-        for url in regular:
-            queue.append(url)
-            enqueued.add(url)
+            internal_links = (result.links or {}).get("internal", [])
+            prioritized: list[tuple[int, str]] = []
+            regular: list[str] = []
+
+            for link in internal_links:
+                if isinstance(link, dict):
+                    raw_href = str(link.get("href", "")).strip()
+                    link_text = str(link.get("text", "")).strip()
+                else:
+                    raw_href = str(link).strip()
+                    link_text = ""
+
+                normalized = normalize_internal_url(raw_href, effective_url, origin_domain)
+                if not normalized:
+                    continue
+                if normalized in visited or normalized in enqueued:
+                    continue
+
+                priority = link_priority(normalized, link_text)
+                if priority > 0:
+                    prioritized.append((priority, normalized))
+                else:
+                    regular.append(normalized)
+
+            for _, url in sorted(prioritized, key=lambda item: item[0]):
+                queue.appendleft(url)
+                enqueued.add(url)
+            for url in regular:
+                queue.append(url)
+                enqueued.add(url)
 
     return pages
 
@@ -1030,7 +1123,14 @@ def load_urls(args: argparse.Namespace) -> list[str]:
     return unique
 
 
-async def run(urls: list[str], max_pages: int, output_dir: Path, verbose: bool) -> None:
+async def run(
+    urls: list[str],
+    max_pages: int,
+    output_dir: Path,
+    verbose: bool,
+    site_concurrency: int,
+    page_concurrency: int,
+) -> None:
     if AsyncWebCrawler is None:
         raise SystemExit(
             "crawl4ai не установлен. Установите зависимости: "
@@ -1042,30 +1142,38 @@ async def run(urls: list[str], max_pages: int, output_dir: Path, verbose: bool) 
     run_config = build_run_config()
 
     async with create_crawler(browser_config) as crawler:
-        for url in urls:
-            domain = domain_slug(url)
-            site_dir = output_dir / domain
-            site_dir.mkdir(parents=True, exist_ok=True)
+        site_semaphore = asyncio.Semaphore(max(1, site_concurrency))
 
-            pages = await crawl_site_pages(
-                crawler=crawler,
-                start_url=url,
-                max_pages=max_pages,
-                run_config=run_config,
-                verbose=verbose,
-            )
-            prices = extract_prices(pages, domain)
-            specialists = extract_specialists(pages, domain)
-            contacts = extract_contacts(pages, domain)
+        async def process_site(url: str) -> None:
+            async with site_semaphore:
+                domain = domain_slug(url)
+                site_dir = output_dir / domain
+                site_dir.mkdir(parents=True, exist_ok=True)
 
-            write_pricing_csv(site_dir / "pricing.csv", prices)
-            write_specialists_csv(site_dir / "specialists.csv", specialists)
-            write_contacts_csv(site_dir / "contacts.csv", contacts)
+                pages = await crawl_site_pages(
+                    crawler=crawler,
+                    start_url=url,
+                    max_pages=max_pages,
+                    run_config=run_config,
+                    verbose=verbose,
+                    page_concurrency=max(1, page_concurrency),
+                )
+                prices = extract_prices(pages, domain)
+                specialists = extract_specialists(pages, domain)
+                contacts = extract_contacts(pages, domain)
 
-            print(
-                f"[done] {display_url(url)} | pages={len(pages)} prices={len(prices)} "
-                f"specialists={len(specialists)} contacts={len(contacts)} -> {site_dir}"
-            )
+                write_pricing_csv(site_dir / "pricing.csv", prices)
+                write_specialists_csv(site_dir / "specialists.csv", specialists)
+                write_contacts_csv(site_dir / "contacts.csv", contacts)
+
+                print(
+                    f"[done] {display_url(url)} | pages={len(pages)} prices={len(prices)} "
+                    f"specialists={len(specialists)} contacts={len(contacts)} -> {site_dir}"
+                )
+
+        tasks = [asyncio.create_task(process_site(url)) for url in urls]
+        for task in tasks:
+            await task
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1075,6 +1183,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--url", action="append", help="Website URL (can be repeated).")
     parser.add_argument("--url-file", help="Path to text file with URLs (one per line).")
     parser.add_argument("--max-pages", type=int, default=40, help="Max pages to crawl per site.")
+    parser.add_argument("--site-concurrency", type=int, default=1, help="How many sites to crawl in parallel.")
+    parser.add_argument("--page-concurrency", type=int, default=1, help="How many pages to fetch in parallel.")
     parser.add_argument("--output-dir", default="output", help="Directory for CSV output.")
     parser.add_argument("--verbose", action="store_true", help="Print crawling progress.")
     return parser
@@ -1092,6 +1202,8 @@ def main() -> None:
             max_pages=max(1, args.max_pages),
             output_dir=Path(args.output_dir),
             verbose=args.verbose,
+            site_concurrency=max(1, args.site_concurrency),
+            page_concurrency=max(1, args.page_concurrency),
         )
     )
 

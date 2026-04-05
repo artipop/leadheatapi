@@ -283,7 +283,7 @@ def resolve_short_url(url: str, timeout_seconds: int = 15) -> Optional[str]:
     try:
         with urlopen(request, timeout=timeout_seconds) as response:
             final_url = response.geturl()
-    except (HTTPError, URLError, TimeoutError, ValueError):
+    except (HTTPError, URLError, TimeoutError, ValueError, OSError):  # OSErr -> ConnResetErr
         return None
 
     normalized = normalize_http_url(final_url)
@@ -303,7 +303,7 @@ def resolve_site_redirect(url: str, timeout_seconds: int = 15) -> Optional[str]:
     try:
         with urlopen(request, timeout=timeout_seconds) as response:
             final_url = response.geturl()
-    except (HTTPError, URLError, TimeoutError, ValueError):
+    except (HTTPError, URLError, TimeoutError, ValueError, OSError):  # OSErr -> ConnResetErr
         return normalized_input
 
     normalized_final = normalize_site_origin_url(final_url)
@@ -509,6 +509,8 @@ async def run_streaming(
     vk_csv: Path,
     other_links_csv: Path,
     verbose: bool,
+    site_concurrency: int,
+    page_concurrency: int,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     browser_config = build_browser_config()
@@ -533,23 +535,23 @@ async def run_streaming(
     appended_vk_rows = 0
     appended_other_rows = 0
 
-    def resolve_short_url_cached(raw_url: str) -> Optional[str]:
+    async def resolve_short_url_cached(raw_url: str) -> Optional[str]:
         key = raw_url.strip()
         cached = short_url_cache.get(key)
         if cached is not None or key in short_url_cache:
             return cached
-        resolved = resolve_short_url(key)
+        resolved = await asyncio.to_thread(resolve_short_url, key)
         short_url_cache[key] = resolved
         return resolved
 
-    def resolve_site_redirect_cached(raw_url: str) -> Optional[str]:
+    async def resolve_site_redirect_cached(raw_url: str) -> Optional[str]:
         normalized = normalize_site_origin_url(raw_url)
         if not normalized:
             return None
         cached = site_redirect_cache.get(normalized)
         if cached is not None or normalized in site_redirect_cache:
             return cached
-        resolved = resolve_site_redirect(normalized)
+        resolved = await asyncio.to_thread(resolve_site_redirect, normalized)
         site_redirect_cache[normalized] = resolved
         return resolved
 
@@ -655,7 +657,7 @@ async def run_streaming(
             logger.info("Firm %s/%s: id=%s name=%s", index, len(firms), firm_id, company_name or "-")
 
             try:
-                sites = get_firm_sites(city_code=city_code, firm_id=firm_id)
+                sites = await asyncio.to_thread(get_firm_sites, city_code, firm_id)
             except Exception as exc:
                 logger.exception("Failed to resolve sites for firm_id=%s: %s", firm_id, exc)
                 failed_attempts.append(f"https://2gis.ru/{city_code}/firm/{firm_id}")
@@ -671,7 +673,7 @@ async def run_streaming(
             for raw_site in sites:
                 processed_site = raw_site
                 if is_clck_url(raw_site):
-                    resolved = resolve_short_url_cached(raw_site)
+                    resolved = await resolve_short_url_cached(raw_site)
                     if not resolved:
                         logger.info(
                             "Skip unresolved clck.ru link from 2GIS card for firm_id=%s: %s",
@@ -774,7 +776,7 @@ async def run_streaming(
                 normalized = normalize_site_origin_url(processed_site)
                 if not normalized:
                     continue
-                resolved_site = resolve_site_redirect_cached(normalized) or normalized
+                resolved_site = await resolve_site_redirect_cached(normalized) or normalized
                 if resolved_site != normalized:
                     logger.info(
                         "Merged site by redirect for firm_id=%s: %s -> %s",
@@ -863,9 +865,11 @@ async def run_streaming(
                 [to_display_url(site) for site in selected_sites],
             )
 
-            for site_url in selected_sites:
+            site_semaphore = asyncio.Semaphore(max(1, site_concurrency))
+
+            async def process_site_url(site_url: str) -> None:
                 if is_hh_url(site_url):
-                    continue
+                    return
                 platform_kind = classify_platform_url(site_url)
                 if platform_kind is not None:
                     logger.info(
@@ -874,13 +878,13 @@ async def run_streaming(
                         firm_id,
                         to_display_url(site_url),
                     )
-                    continue
+                    return
                 if is_max_url(site_url):
                     logger.info("Skip max.ru site crawl for firm_id=%s: %s", firm_id, to_display_url(site_url))
-                    continue
+                    return
                 if is_dzen_url(site_url):
                     logger.info("Skip dzen site crawl for firm_id=%s: %s", firm_id, to_display_url(site_url))
-                    continue
+                    return
 
                 origin_domain = origin_domain_from_url(site_url)
                 if origin_domain and origin_domain in seen_crawled_origins:
@@ -890,27 +894,29 @@ async def run_streaming(
                         to_display_url(site_url),
                         decode_host_from_idna(origin_domain),
                     )
-                    continue
+                    return
                 if origin_domain:
                     seen_crawled_origins.add(origin_domain)
 
-                try:
-                    pages = await crawl_site_pages(
-                        crawler=crawler,
-                        start_url=site_url,
-                        max_pages=max_pages,
-                        run_config=run_config,
-                        verbose=verbose,
-                    )
-                except Exception as exc:
-                    logger.exception("Crawler failed for site=%s: %s", to_display_url(site_url), exc)
-                    failed_attempts.append(to_display_url(site_url))
-                    continue
+                async with site_semaphore:
+                    try:
+                        pages = await crawl_site_pages(
+                            crawler=crawler,
+                            start_url=site_url,
+                            max_pages=max_pages,
+                            run_config=run_config,
+                            verbose=verbose,
+                            page_concurrency=max(1, page_concurrency),
+                        )
+                    except Exception as exc:
+                        logger.exception("Crawler failed for site=%s: %s", to_display_url(site_url), exc)
+                        failed_attempts.append(to_display_url(site_url))
+                        return
 
                 if not pages:
                     logger.warning("No pages collected for site=%s", to_display_url(site_url))
                     failed_attempts.append(to_display_url(site_url))
-                    continue
+                    return
 
                 domain = domain_slug(site_url)
                 site_dir = output_dir / domain
@@ -931,7 +937,7 @@ async def run_streaming(
                 for source_page_url, link in extract_page_links(pages):
                     processed_link = link
                     if is_clck_url(link):
-                        resolved = resolve_short_url_cached(link)
+                        resolved = await resolve_short_url_cached(link)
                         if not resolved:
                             logger.info("Skip unresolved clck.ru link from site crawl: %s", to_display_url(link))
                             continue
@@ -1063,6 +1069,10 @@ async def run_streaming(
                     extracted_other_count,
                     site_dir,
                 )
+
+            tasks = [asyncio.create_task(process_site_url(site_url)) for site_url in selected_sites]
+            for task in tasks:
+                await task
     logger.info(
         "Appended rows this run -> hh:%s telegram:%s max:%s dzen:%s vk:%s rutube:%s other:%s",
         appended_hh_rows,
@@ -1098,6 +1108,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--city-code", default="moscow", help="2GIS city code for firm card URL.")
     parser.add_argument("--max-sites-per-firm", type=int, default=3, help="Max websites to crawl per firm.")
     parser.add_argument("--max-pages", type=int, default=40, help="Max pages per website.")
+    parser.add_argument("--site-concurrency", type=int, default=1, help="How many sites to crawl in parallel.")
+    parser.add_argument("--page-concurrency", type=int, default=1, help="How many pages to fetch in parallel.")
     parser.add_argument("--output-dir", default="output", help="Directory for per-site CSV output.")
     parser.add_argument(
         "--hh-links-csv",
@@ -1176,6 +1188,8 @@ def main() -> None:
             vk_csv=Path(args.vk_csv),
             other_links_csv=Path(args.other_links_csv),
             verbose=args.verbose,
+            site_concurrency=max(1, args.site_concurrency),
+            page_concurrency=max(1, args.page_concurrency),
         )
     )
 
