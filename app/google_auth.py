@@ -1,8 +1,15 @@
 import os
+from typing import Any
 
 from authlib.integrations.starlette_client import OAuth, OAuthError
 from fastapi import APIRouter, HTTPException, Request
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import RedirectResponse
+
+from app.db import AsyncDatabaseSession
+from app.models import User
 
 router = APIRouter(prefix="/auth/google", tags=["auth"])
 
@@ -26,15 +33,22 @@ async def google_login(request: Request):
 
 
 @router.get("/callback")
-async def google_callback(request: Request):
+async def google_callback(request: Request, db: AsyncDatabaseSession):
     try:
         token = await oauth.google.authorize_access_token(request)
     except OAuthError as exc:
         raise HTTPException(status_code=400, detail=f"OAuth error: {exc.error}") from exc
 
-    user = token.get("userinfo")
-    if user:
-        request.session['user'] = dict(user)
+    userinfo = token.get("userinfo")
+    if not userinfo:
+        raise HTTPException(status_code=400, detail="Failed to read Google user info")
+
+    user = await create_or_update(db, userinfo)
+    request.session['user'] = {
+        "id": user.id,
+        "email": user.email,
+        "fullname": user.fullname,
+    }
     return RedirectResponse(url='/')
 
 
@@ -50,3 +64,27 @@ async def me(request: Request):
 async def logout(request: Request):
     request.session.pop('user', None)
     return RedirectResponse(url='/')
+
+
+async def create_or_update(db: AsyncSession, userinfo: dict[str, Any]) -> User:
+    email = userinfo.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Google user info is missing 'email'")
+
+    result = await db.execute(select(User).where(User.email == str(email)))
+    user = result.scalar_one_or_none()
+    if not user:
+        user = User(email=str(email), fullname=userinfo.get("name"))
+        db.add(user)
+    else:
+        user.email = str(email)
+        user.fullname = userinfo.get("name")
+
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="User already exists with conflicting identity data") from exc
+
+    await db.refresh(user)
+    return user
