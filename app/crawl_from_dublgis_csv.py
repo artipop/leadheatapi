@@ -42,7 +42,20 @@ MAX_FIELDNAMES = ("firm_id", "company_name", "address_name", "site_url", "max_ch
 DZEN_FIELDNAMES = ("firm_id", "company_name", "address_name", "site_url", "dzen_url", "source")
 RUTUBE_FIELDNAMES = ("firm_id", "company_name", "address_name", "site_url", "link_url", "link_host", "source")
 VK_FIELDNAMES = ("firm_id", "company_name", "address_name", "site_url", "link_url", "link_host", "source")
+DRIVE2_FIELDNAMES = ("firm_id", "company_name", "address_name", "site_url", "link_url", "link_host", "source")
 OTHER_LINKS_FIELDNAMES = ("firm_id", "company_name", "address_name", "site_url", "link_url", "link_host", "source")
+BOOKING_FIELDNAMES = (
+    "firm_id",
+    "company_name",
+    "address_name",
+    "site_url",
+    "booking_mode",
+    "has_booking_form",
+    "has_booking_widget",
+    "booking_widget_provider",
+    "booking_widget_host",
+    "booking_evidence",
+)
 VIDEO_HOST_DOMAINS = {
     "rutube.ru",
     "youtube.com",
@@ -71,6 +84,66 @@ SOCIAL_HOST_DOMAINS = {
     "max.ru",
     "dzen.ru",
 }
+BOOKING_TEXT_HINTS = (
+    "запис",
+    "онлайн запис",
+    "запись на прием",
+    "запись к врачу",
+    "appointment",
+    "book appointment",
+    "online booking",
+    "schedule appointment",
+)
+BOOKING_URL_HINTS = (
+    "booking",
+    "appointment",
+    "book",
+    "schedule",
+    "record",
+    "zapis",
+    "online-record",
+    "online-zapis",
+)
+BOOKING_FORM_FIELD_HINTS = (
+    "name",
+    "phone",
+    "email",
+    "date",
+    "time",
+    "doctor",
+    "service",
+    "patient",
+    "имя",
+    "тел",
+    "почт",
+    "дата",
+    "время",
+    "врач",
+    "услуг",
+    "пациент",
+)
+BOOKING_PROVIDER_DOMAINS: dict[str, set[str]] = {
+    "yclients": {"yclients.com", "alteg.io", "altegio.com", "altegio.ru"},
+    "dikidi": {"dikidi.net", "dikidi.ru"},
+    "medflex": {"medflex.ru"},
+    "docdoc": {"docdoc.ru", "sberhealth.ru"},
+    "napopravku": {"napopravku.ru"},
+    "prodoctorov": {"prodoctorov.ru"},
+    "bitrix24_forms": {"bitrix24.ru", "bitrix.info"},
+    "amocrm_forms": {"amocrm.ru", "amoforms.com"},
+    "infoclinica": {"infoclinica.ru"},
+}
+BOOKING_SOURCE_ATTRS = (
+    "href",
+    "src",
+    "action",
+    "data-url",
+    "data-href",
+    "data-src",
+    "data-widget-url",
+    "data-form-url",
+    "data-booking-url",
+)
 
 
 def normalize_site_url(url: str) -> Optional[str]:
@@ -232,6 +305,15 @@ def is_dzen_url(url: str) -> bool:
     return is_dzen_host(split_http_like_url(url).hostname or "")
 
 
+def is_drive2_host(host: str) -> bool:
+    value = normalize_host_for_url(host)
+    return value == "drive2.ru" or value.endswith(".drive2.ru")
+
+
+def is_drive2_url(url: str) -> bool:
+    return is_drive2_host(split_http_like_url(url).hostname or "")
+
+
 def host_matches_domain_list(host: str, domains: set[str]) -> bool:
     normalized = normalize_host_for_url(host)
     if not normalized:
@@ -243,6 +325,8 @@ def classify_platform_url(url: str) -> Optional[str]:
     host = split_http_like_url(url).hostname or ""
     if host_matches_domain_list(host, VIDEO_HOST_DOMAINS):
         return "video_hosting"
+    if is_drive2_host(host):
+        return "drive2"
     if host_matches_domain_list(host, SOCIAL_HOST_DOMAINS):
         return "social_network"
     return None
@@ -414,6 +498,171 @@ def has_invalid_http_port(url: str) -> bool:
     return False
 
 
+def compact_match_text(text: str) -> str:
+    return " ".join((text or "").lower().replace("ё", "е").split())
+
+
+def contains_any_fragment(text: str, fragments: tuple[str, ...]) -> bool:
+    compact = compact_match_text(text)
+    return any(fragment in compact for fragment in fragments)
+
+
+def url_has_booking_hint(url: str) -> bool:
+    normalized = normalize_http_url(url)
+    if not normalized:
+        return False
+    parsed = urlsplit(normalized)
+    normalized_parts = compact_match_text(f"{parsed.netloc}{parsed.path}?{parsed.query}")
+    return any(hint in normalized_parts for hint in BOOKING_URL_HINTS)
+
+
+def booking_provider_by_host(host: str) -> Optional[str]:
+    normalized = normalize_host_for_url(host)
+    if not normalized:
+        return None
+    for provider, domains in BOOKING_PROVIDER_DOMAINS.items():
+        if host_matches_domain_list(normalized, domains):
+            return provider
+    return None
+
+
+def extract_http_urls_from_tag(tag, page_url: str) -> set[str]:
+    urls: set[str] = set()
+    for attr_name in BOOKING_SOURCE_ATTRS:
+        raw_value = str(tag.get(attr_name, "")).strip()
+        if not raw_value:
+            continue
+        resolved, _ = urldefrag(urljoin(page_url, raw_value))
+        normalized = normalize_http_url(resolved)
+        if normalized:
+            urls.add(normalized)
+    return urls
+
+
+def detect_booking_features(pages, site_url: str) -> dict[str, str]:
+    has_booking_form = False
+    has_booking_widget = False
+    provider_names: set[str] = set()
+    provider_hosts: set[str] = set()
+    evidence: list[str] = []
+
+    def add_evidence(kind: str, page_url: str, details: str) -> None:
+        page = to_display_url(page_url)
+        compact_details = compact_match_text(details)[:160]
+        line = f"{kind}:{page} ({compact_details})" if compact_details else f"{kind}:{page}"
+        if line not in evidence:
+            evidence.append(line)
+
+    for page in pages:
+        if not page.html:
+            continue
+        soup = BeautifulSoup(page.html, "html.parser")
+
+        for form in soup.find_all("form"):
+            class_attr = form.get("class", [])
+            class_value = " ".join(class_attr) if isinstance(class_attr, list) else str(class_attr)
+            form_text = " ".join(
+                [
+                    str(form.get("id", "")),
+                    class_value,
+                    str(form.get("name", "")),
+                    str(form.get("action", "")),
+                    form.get_text(" ", strip=True)[:1000],
+                ]
+            )
+            controls_text = " ".join(
+                " ".join(
+                    [
+                        str(control.get("name", "")),
+                        str(control.get("id", "")),
+                        str(control.get("placeholder", "")),
+                        str(control.get("aria-label", "")),
+                    ]
+                )
+                for control in form.find_all(["input", "textarea", "select", "button"])
+            )
+            searchable = compact_match_text(f"{form_text} {controls_text}")
+            has_form_hints = contains_any_fragment(searchable, BOOKING_TEXT_HINTS)
+            has_form_fields = contains_any_fragment(searchable, BOOKING_FORM_FIELD_HINTS)
+
+            action_raw = str(form.get("action", "")).strip()
+            action_url = normalize_http_url(urljoin(page.url, action_raw)) if action_raw else None
+            action_has_booking_hint = bool(action_url and url_has_booking_hint(action_url))
+            if not ((has_form_hints and has_form_fields) or action_has_booking_hint):
+                continue
+
+            has_booking_form = True
+            if action_url and not is_internal_for_site(action_url, site_url):
+                action_host = normalize_host_for_url(urlsplit(action_url).hostname or "")
+                if action_host:
+                    has_booking_widget = True
+                    provider_hosts.add(action_host)
+                    provider = booking_provider_by_host(action_host)
+                    provider_names.add(provider or f"external:{decode_host_from_idna(action_host)}")
+                    add_evidence("form_action", page.url, decode_host_from_idna(action_host))
+                    continue
+            add_evidence("form", page.url, "booking form detected")
+
+        for tag in soup.find_all(["a", "iframe", "script"]):
+            class_attr = tag.get("class", [])
+            class_value = " ".join(class_attr) if isinstance(class_attr, list) else str(class_attr)
+            tag_text = compact_match_text(
+                " ".join(
+                    [
+                        str(tag.get("id", "")),
+                        class_value,
+                        str(tag.get("title", "")),
+                        str(tag.get("aria-label", "")),
+                        tag.get_text(" ", strip=True)[:400],
+                    ]
+                )
+            )
+
+            for link_url in extract_http_urls_from_tag(tag, page.url):
+                host = normalize_host_for_url(urlsplit(link_url).hostname or "")
+                if not host:
+                    continue
+                is_external = not is_internal_for_site(link_url, site_url)
+                has_booking_hint = url_has_booking_hint(link_url) or contains_any_fragment(
+                    tag_text, BOOKING_TEXT_HINTS
+                )
+                provider = booking_provider_by_host(host)
+                if provider and is_external:
+                    has_booking_widget = True
+                    provider_names.add(provider)
+                    provider_hosts.add(host)
+                    add_evidence("widget", page.url, decode_host_from_idna(host))
+                    continue
+                if is_external and has_booking_hint:
+                    has_booking_widget = True
+                    provider_hosts.add(host)
+                    provider_names.add(f"external:{decode_host_from_idna(host)}")
+                    add_evidence("widget_link", page.url, decode_host_from_idna(host))
+                    continue
+                if tag.name == "a" and not is_external and has_booking_hint:
+                    has_booking_form = True
+                    add_evidence("booking_link", page.url, to_display_url(link_url))
+
+    has_booking = has_booking_form or has_booking_widget
+    if has_booking_form and has_booking_widget:
+        booking_mode = "form+widget"
+    elif has_booking_form:
+        booking_mode = "form"
+    elif has_booking_widget:
+        booking_mode = "widget"
+    else:
+        booking_mode = "none"
+
+    return {
+        "booking_mode": booking_mode,
+        "has_booking_form": "1" if has_booking_form else "0",
+        "has_booking_widget": "1" if has_booking_widget else "0",
+        "booking_widget_provider": "; ".join(sorted(provider_names)),
+        "booking_widget_host": "; ".join(sorted(decode_host_from_idna(host) for host in provider_hosts)),
+        "booking_evidence": " | ".join(evidence[:6]),
+    }
+
+
 def extract_page_links(pages) -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -507,7 +756,9 @@ async def run_streaming(
     dzen_csv: Path,
     rutube_csv: Path,
     vk_csv: Path,
+    drive2_csv: Path,
     other_links_csv: Path,
+    booking_csv: Path,
     verbose: bool,
     site_concurrency: int,
     page_concurrency: int,
@@ -523,7 +774,9 @@ async def run_streaming(
     seen_dzen = load_seen_pairs(dzen_csv, "firm_id", "dzen_url")
     seen_rutube = load_seen_pairs(rutube_csv, "firm_id", "link_url")
     seen_vk = load_seen_pairs(vk_csv, "firm_id", "link_url")
+    seen_drive2 = load_seen_pairs(drive2_csv, "firm_id", "link_url")
     seen_other = load_seen_pairs(other_links_csv, "firm_id", "link_url")
+    seen_booking = load_seen_pairs(booking_csv, "firm_id", "site_url")
     seen_crawled_origins: set[str] = set()
     short_url_cache: dict[str, Optional[str]] = {}
     site_redirect_cache: dict[str, Optional[str]] = {}
@@ -533,7 +786,9 @@ async def run_streaming(
     appended_dzen_rows = 0
     appended_rutube_rows = 0
     appended_vk_rows = 0
+    appended_drive2_rows = 0
     appended_other_rows = 0
+    appended_booking_rows = 0
 
     async def resolve_short_url_cached(raw_url: str) -> Optional[str]:
         key = raw_url.strip()
@@ -618,6 +873,24 @@ async def run_streaming(
         appended_vk_rows += append_csv_rows(vk_csv, VK_FIELDNAMES, [row])
         return True
 
+    def append_drive2_row(row: dict[str, str]) -> bool:
+        nonlocal appended_drive2_rows
+        key = ((row.get("firm_id") or "").strip(), (row.get("link_url") or "").strip())
+        if not key[0] or not key[1] or key in seen_drive2:
+            return False
+        seen_drive2.add(key)
+        appended_drive2_rows += append_csv_rows(drive2_csv, DRIVE2_FIELDNAMES, [row])
+        return True
+
+    def append_booking_row(row: dict[str, str]) -> bool:
+        nonlocal appended_booking_rows
+        key = ((row.get("firm_id") or "").strip(), (row.get("site_url") or "").strip())
+        if not key[0] or not key[1] or key in seen_booking:
+            return False
+        seen_booking.add(key)
+        appended_booking_rows += append_csv_rows(booking_csv, BOOKING_FIELDNAMES, [row])
+        return True
+
     def append_platform_link(
         *,
         firm_id_value: str,
@@ -643,9 +916,12 @@ async def run_streaming(
         }
         if platform_kind == "video_hosting":
             inserted = append_rutube_row(base_row)
+        elif platform_kind == "drive2":
+            inserted = append_drive2_row(base_row)
         else:
             inserted = append_vk_row(base_row)
-        append_other_row(base_row)
+        if platform_kind != "drive2":
+            append_other_row(base_row)
         return inserted
 
     async with create_crawler(browser_config) as crawler:
@@ -928,6 +1204,17 @@ async def run_streaming(
                 write_pricing_csv(site_dir / "pricing.csv", prices)
                 write_specialists_csv(site_dir / "specialists.csv", specialists)
                 write_contacts_csv(site_dir / "contacts.csv", contacts)
+                booking_features = detect_booking_features(pages, site_url)
+                if booking_features["booking_mode"] != "none":
+                    append_booking_row(
+                        {
+                            "firm_id": firm_id,
+                            "company_name": company_name,
+                            "address_name": address_name,
+                            "site_url": site_url,
+                            **booking_features,
+                        }
+                    )
 
                 extracted_hh_count = 0
                 extracted_telegram_count = 0
@@ -1056,12 +1343,16 @@ async def run_streaming(
                         extracted_other_count += 1
 
                 logger.info(
-                    "SUCCESS: %s | pages=%s prices=%s specialists=%s contacts=%s hh_employer_links=%s telegram_links=%s max_channels=%s dzen_links=%s other_links=%s -> %s",
+                    "SUCCESS: %s | pages=%s prices=%s specialists=%s contacts=%s booking_mode=%s has_form=%s has_widget=%s providers=%s hh_employer_links=%s telegram_links=%s max_channels=%s dzen_links=%s other_links=%s -> %s",
                     to_display_url(site_url),
                     len(pages),
                     len(prices),
                     len(specialists),
                     len(contacts),
+                    booking_features["booking_mode"],
+                    booking_features["has_booking_form"],
+                    booking_features["has_booking_widget"],
+                    booking_features["booking_widget_provider"] or "-",
                     extracted_hh_count,
                     extracted_telegram_count,
                     extracted_max_count,
@@ -1074,14 +1365,16 @@ async def run_streaming(
             for task in tasks:
                 await task
     logger.info(
-        "Appended rows this run -> hh:%s telegram:%s max:%s dzen:%s vk:%s rutube:%s other:%s",
+        "Appended rows this run -> hh:%s telegram:%s max:%s dzen:%s vk:%s rutube:%s drive2:%s other:%s booking:%s",
         appended_hh_rows,
         appended_telegram_rows,
         appended_max_rows,
         appended_dzen_rows,
         appended_vk_rows,
         appended_rutube_rows,
+        appended_drive2_rows,
         appended_other_rows,
+        appended_booking_rows,
     )
     logger.info("HH links CSV: %s", hh_links_csv)
     logger.info("Telegram links CSV: %s", telegram_csv)
@@ -1089,7 +1382,9 @@ async def run_streaming(
     logger.info("Dzen links CSV: %s", dzen_csv)
     logger.info("VK/social links CSV: %s", vk_csv)
     logger.info("Rutube/video links CSV: %s", rutube_csv)
+    logger.info("Drive2 links CSV: %s", drive2_csv)
     logger.info("Other links CSV: %s", other_links_csv)
+    logger.info("Booking features CSV: %s", booking_csv)
 
     if failed_attempts:
         print("\nFailed attempts:")
@@ -1142,9 +1437,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="CSV file for social network links (vk and similar).",
     )
     parser.add_argument(
+        "--drive2-csv",
+        default="output/drive2.csv",
+        help="CSV file for found drive2.ru links (not crawled).",
+    )
+    parser.add_argument(
         "--other-links-csv",
         default="output/other_links.csv",
         help="CSV file for other external links found on crawled sites.",
+    )
+    parser.add_argument(
+        "--booking-csv",
+        default="output/booking_features.csv",
+        help="CSV file with booking form/widget detection per crawled site.",
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose crawling progress.")
     return parser
@@ -1186,7 +1491,9 @@ def main() -> None:
             dzen_csv=Path(args.dzen_csv),
             rutube_csv=Path(args.rutube_csv),
             vk_csv=Path(args.vk_csv),
+            drive2_csv=Path(args.drive2_csv),
             other_links_csv=Path(args.other_links_csv),
+            booking_csv=Path(args.booking_csv),
             verbose=args.verbose,
             site_concurrency=max(1, args.site_concurrency),
             page_concurrency=max(1, args.page_concurrency),

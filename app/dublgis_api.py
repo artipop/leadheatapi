@@ -12,7 +12,10 @@ logger = logging.getLogger(__name__)
 
 
 class DublgisApiError(Exception):
-    pass
+    def __init__(self, status_code: Any, payload: dict[str, Any]):
+        self.status_code = status_code
+        self.payload = payload
+        super().__init__(f"2GIS API returned code={status_code}: {payload}")
 
 
 @dataclass
@@ -45,7 +48,7 @@ class DublgisApiClient:
         meta = payload.get("meta", {})
         status_code = meta.get("code")
         if status_code != 200:
-            raise DublgisApiError(f"2GIS API returned code={status_code}: {payload}")
+            raise DublgisApiError(status_code=status_code, payload=payload)
 
         return payload
 
@@ -76,14 +79,33 @@ def iter_all_pages(
 
     while True:
         logger.info("Requesting page %s", page)
-        payload = client.fetch_items_page(
-            rubric_ids=rubric_ids,
-            region_id=region_id,
-            api_key=api_key,
-            page=page,
-            page_size=page_size,
-            search_type=search_type,
-        )
+        try:
+            payload = client.fetch_items_page(
+                rubric_ids=rubric_ids,
+                region_id=region_id,
+                api_key=api_key,
+                page=page,
+                page_size=page_size,
+                search_type=search_type,
+            )
+        except DublgisApiError as exc:
+            error_type = (
+                exc.payload.get("meta", {}).get("error", {}).get("type")
+                if isinstance(exc.payload, dict)
+                else None
+            )
+            if exc.status_code == 404 and error_type == "itemNotFound":
+                logger.info(
+                    "Stopping pagination: page %s returned itemNotFound (404)", page
+                )
+                if expected_total is not None and collected != expected_total:
+                    logger.warning(
+                        "API total mismatch: collected=%s, expected_total=%s",
+                        collected,
+                        expected_total,
+                    )
+                break
+            raise
         result = payload.get("result", {})
         page_items = result.get("items", [])
 
@@ -120,7 +142,6 @@ def fetch_all_items(
     search_type: str = "one_branch",
     client: Optional[DublgisApiClient] = None,
 ) -> list[dict[str, Any]]:
-    print(rubric_ids)
     items: list[dict[str, Any]] = []
     for payload in iter_all_pages(
         rubric_ids=rubric_ids,

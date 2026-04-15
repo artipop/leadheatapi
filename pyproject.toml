@@ -9,6 +9,7 @@ dependencies = [
     "asyncpg>=0.31.0",
     "authlib>=1.6.0",
     "bs4>=0.0.2",
+    "crawl4ai>=0.8.6",
     "fastapi[standard-no-fastapi-cloud-cli]>=0.135.2",
     "itsdangerous>=2.2.0", # required by `starlette.middleware.sessions`
     "sqlalchemy>=2.0.49",
