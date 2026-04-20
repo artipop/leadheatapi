@@ -172,6 +172,8 @@ def normalize_site_url(url: str) -> Optional[str]:
     host = normalize_host_for_url(parsed.hostname or "")
     if not host:
         return None
+    if is_reg_ru_host(host):
+        return None
 
     try:
         port = parsed.port
@@ -201,6 +203,8 @@ def normalize_site_origin_url(url: str) -> Optional[str]:
         return None
     host = normalize_host_for_url(parsed.hostname or "")
     if not host:
+        return None
+    if is_reg_ru_host(host):
         return None
 
     try:
@@ -327,6 +331,11 @@ def is_drive2_url(url: str) -> bool:
     return is_drive2_host(split_http_like_url(url).hostname or "")
 
 
+def is_reg_ru_host(host: str) -> bool:
+    value = normalize_host_for_url(host)
+    return value == "reg.ru" or value.endswith(".reg.ru")
+
+
 def host_matches_domain_list(host: str, domains: set[str]) -> bool:
     normalized = normalize_host_for_url(host)
     if not normalized:
@@ -353,6 +362,8 @@ def normalize_http_url(url: str) -> Optional[str]:
 
     host = normalize_host_for_url(parsed.hostname or "")
     if not host:
+        return None
+    if is_reg_ru_host(host):
         return None
 
     try:
@@ -402,6 +413,10 @@ def resolve_site_redirect(url: str, timeout_seconds: int = 15) -> Optional[str]:
             final_url = response.geturl()
     except (HTTPError, URLError, TimeoutError, ValueError, OSError):  # OSErr -> ConnResetErr
         return normalized_input
+
+    final_host = normalize_host_for_url(urlsplit(final_url).hostname or "")
+    if is_reg_ru_host(final_host):
+        return None
 
     normalized_final = normalize_site_origin_url(final_url)
     return normalized_final or normalized_input
@@ -1204,6 +1219,9 @@ class SiteCrawlerPipeline:
             if is_jivo_url(processed_site):
                 logger.info("Skip jivo.chat from 2GIS card: firm_id=%s url=%s", firm.firm_id, to_display_url(processed_site))
                 continue
+            if is_reg_ru_host(split_http_like_url(processed_site).hostname or ""):
+                logger.info("Skip reg.ru from 2GIS card: firm_id=%s url=%s", firm.firm_id, to_display_url(processed_site))
+                continue
 
             direct_social = self._classify_social_link(
                 firm=firm,
@@ -1219,7 +1237,9 @@ class SiteCrawlerPipeline:
             if not normalized_site:
                 continue
 
-            resolved_site = await self._resolve_site_redirect_cached(normalized_site) or normalized_site
+            resolved_site = await self._resolve_site_redirect_cached(normalized_site)
+            if not resolved_site:
+                continue
             if resolved_site != normalized_site:
                 logger.info(
                     "Merged site by redirect for firm_id=%s: %s -> %s",

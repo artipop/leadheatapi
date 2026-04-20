@@ -42,6 +42,7 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/136.0.0.0 Safari/537.36"
 )
+DEFAULT_CRAWLER_PAGE_TIMEOUT_SECONDS = 15
 
 SKIP_EXTENSIONS = {
     ".jpg",
@@ -254,6 +255,11 @@ def normalize_host(host: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+def is_reg_ru_host(host: str) -> bool:
+    normalized = normalize_host(host)
+    return normalized == "reg.ru" or normalized.endswith(".reg.ru")
+
+
 def decode_idna_host(host: str) -> str:
     normalized = normalize_host(host)
     if not normalized:
@@ -301,6 +307,8 @@ def normalize_start_url(url: str) -> str:
     parsed = urlparse(trimmed)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError(f"Invalid URL: {url}")
+    if is_reg_ru_host(parsed.hostname or ""):
+        raise ValueError(f"Blocked host for crawl: {parsed.hostname}")
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}"
 
 
@@ -324,6 +332,8 @@ def normalize_internal_url(raw_url: str, source_url: str, origin_domain: str) ->
         return None
 
     host = normalize_host(parsed.netloc)
+    if is_reg_ru_host(host):
+        return None
     if host != origin_domain and not host.endswith(f".{origin_domain}"):
         return None
     if is_binary_path(parsed.path):
@@ -902,20 +912,32 @@ def build_run_config() -> Any:
     if CrawlerRunConfig is None:
         return None
 
+    timeout_seconds_raw = os.getenv("CRAWLER_PAGE_TIMEOUT_SECONDS", str(DEFAULT_CRAWLER_PAGE_TIMEOUT_SECONDS))
+    try:
+        timeout_seconds = float(timeout_seconds_raw)
+    except ValueError:
+        timeout_seconds = float(DEFAULT_CRAWLER_PAGE_TIMEOUT_SECONDS)
+    timeout_ms = max(1000, int(timeout_seconds * 1000))
+
     candidates = []
+    timed_kwargs_variants = (
+        {"page_timeout": timeout_ms},
+        {"timeout": timeout_ms},
+        {},
+    )
+    common_kwargs = {"remove_overlay_elements": True, "word_count_threshold": 1, "exclude_domains": ["reg.ru"]}
+
     if CacheMode is not None and hasattr(CacheMode, "BYPASS"):
-        candidates.append(
-            {
-                "cache_mode": CacheMode.BYPASS,
-                "remove_overlay_elements": True,
-                "word_count_threshold": 1,
-            }
-        )
+        for timed_kwargs in timed_kwargs_variants:
+            candidates.append({"cache_mode": CacheMode.BYPASS, **common_kwargs, **timed_kwargs})
+
+    for timed_kwargs in timed_kwargs_variants:
+        candidates.append({"bypass_cache": True, **common_kwargs, **timed_kwargs})
 
     candidates.extend(
         [
-            {"bypass_cache": True, "remove_overlay_elements": True, "word_count_threshold": 1},
             {"bypass_cache": True},
+            {"exclude_domains": ["reg.ru"]},
             {},
         ]
     )
