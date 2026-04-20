@@ -3,6 +3,7 @@ import csv
 import json
 import logging
 from dataclasses import dataclass
+from time import sleep
 from typing import Any
 from typing import Optional
 from urllib.parse import urlencode
@@ -22,6 +23,8 @@ class DublgisApiError(Exception):
 class DublgisApiClient:
     api_url: str = "https://catalog.api.2gis.com/3.0/items"
     timeout_seconds: int = 20
+    max_retries: int = 3
+    retry_delay_seconds: float = 1.0
 
     def fetch_items_page(
         self,
@@ -29,7 +32,7 @@ class DublgisApiClient:
         region_id: int,
         api_key: str,
         page: int = 1,
-        page_size: int = 20,
+        page_size: int = 50,
         search_type: str = "one_branch",
     ) -> dict[str, Any]:
         params = {
@@ -42,22 +45,42 @@ class DublgisApiClient:
         }
 
         url = f"{self.api_url}?{urlencode(params)}"
-        with urlopen(url, timeout=self.timeout_seconds) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        attempt = 0
 
-        meta = payload.get("meta", {})
-        status_code = meta.get("code")
-        if status_code != 200:
+        while True:
+            attempt += 1
+            with urlopen(url, timeout=self.timeout_seconds) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+
+            meta = payload.get("meta", {})
+            status_code = meta.get("code")
+            if status_code == 200:
+                return payload
+
+            error_type = meta.get("error", {}).get("type") if isinstance(meta, dict) else None
+            is_item_not_found = status_code == 404 and error_type == "itemNotFound"
+            can_retry = attempt <= self.max_retries
+
+            if can_retry and not is_item_not_found:
+                logger.warning(
+                    "2GIS API returned code=%s (page=%s), retrying %s/%s after %ss",
+                    status_code,
+                    page,
+                    attempt,
+                    self.max_retries,
+                    self.retry_delay_seconds,
+                )
+                sleep(self.retry_delay_seconds)
+                continue
+
             raise DublgisApiError(status_code=status_code, payload=payload)
-
-        return payload
 
 
 def iter_all_pages(
     rubric_ids: list[int],
     region_id: int,
     api_key: str,
-    page_size: int = 20,
+    page_size: int = 50,
     search_type: str = "one_branch",
     client: Optional[DublgisApiClient] = None,
 ):
@@ -138,7 +161,7 @@ def fetch_all_items(
     rubric_ids: list[int],
     region_id: int,
     api_key: str,
-    page_size: int = 20,
+    page_size: int = 50,
     search_type: str = "one_branch",
     client: Optional[DublgisApiClient] = None,
 ) -> list[dict[str, Any]]:
@@ -191,7 +214,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--rubric-id", type=int, action="append", required=True)
     parser.add_argument("--region-id", type=int, required=True)
     parser.add_argument("--api-key", required=True)
-    parser.add_argument("--page-size", type=int, default=20)
+    parser.add_argument("--page-size", type=int, default=50)
     parser.add_argument("--search-type", default="one_branch")
     parser.add_argument("--output-csv", default="dublgis_items.csv")
     return parser.parse_args()

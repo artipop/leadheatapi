@@ -11,3 +11,34 @@
 `curl "https://catalog.api.2gis.com/3.0/items?rubric_id=222,112852&region_id=32&key=${MYKEY}"`
 + `&search_type=one_branch`
 + `&page_size=10&page=1`
+
+
+nsk 1
+kransnoyarsk 7
+ekat 9
+msk 32
+spb 38
+omsk 2
+kazan 21
+
+rubrics
+
+stomatologiya
+222,112852
+
+detailing
+110301
+
+beauty saloons
+305,5603
+
+wellness
+psychologicheskaya pomosch???
+
+sport
+110427 Батутные центры
+267 Тренажёрные залы
+268 Фитнес-клубы
+20228 Центры йоги
+261 Бассейны
+110332 Аквааэробика

@@ -30,7 +30,7 @@ def resolve_social_csv_path(output_dir: Path, filename: str) -> Path:
     primary = output_dir / filename
     if primary.exists():
         return primary
-    fallback = output_dir / "_socials" / filename
+    fallback = output_dir / "000_socials" / filename
     return fallback
 
 
@@ -160,6 +160,8 @@ def should_skip_obvious_share_link(url: str) -> bool:
     parsed = urlsplit(url)
     host = (parsed.hostname or "").lower()
     path = parsed.path or ""
+    if host == "drive2.ru" or host.endswith(".drive2.ru"):
+        return True
     if host in {"t.me", "telegram.me"} and path.startswith("/share"):
         return True
     if host == "vk.com" and path.startswith("/share"):

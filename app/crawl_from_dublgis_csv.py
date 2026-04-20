@@ -4,9 +4,11 @@ import argparse
 import asyncio
 import csv
 import logging
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
-from typing import Optional
+from typing import Any, Iterable, Optional, Protocol
 from urllib.error import HTTPError
 from urllib.error import URLError
 from urllib.parse import SplitResult, parse_qsl, urlencode, urldefrag, urljoin, urlsplit, urlunsplit
@@ -55,6 +57,17 @@ BOOKING_FIELDNAMES = (
     "booking_widget_provider",
     "booking_widget_host",
     "booking_evidence",
+)
+CRAWL_STATUS_FIELDNAMES = (
+    "firm_id",
+    "company_name",
+    "address_name",
+    "firm_card_url",
+    "site_url",
+    "stage",
+    "status",
+    "details",
+    "updated_at",
 )
 VIDEO_HOST_DOMAINS = {
     "rutube.ru",
@@ -744,6 +757,783 @@ def read_firms(
     return firms
 
 
+@dataclass(frozen=True, slots=True)
+class FirmRecord:
+    firm_id: str
+    company_name: str
+    address_name: str
+    firm_card_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class CrawlTarget:
+    firm: FirmRecord
+    site_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalLinkRecord:
+    firm: FirmRecord
+    site_url: str
+    link_url: str
+    link_host: str
+    kind: str
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
+class CrawlPipelineConfig:
+    city_code: str
+    max_sites_per_firm: int
+    max_pages: int
+    site_concurrency: int
+    page_concurrency: int
+    verbose: bool
+
+
+class CrawlDataSource(Protocol):
+    async def list_firms(self) -> list[FirmRecord]:
+        raise NotImplementedError
+
+
+class CrawlRepository(Protocol):
+    async def record_status(
+        self,
+        *,
+        firm: FirmRecord,
+        stage: str,
+        status: str,
+        site_url: str = "",
+        details: str = "",
+    ) -> None:
+        raise NotImplementedError
+
+    async def save_external_link(self, link: ExternalLinkRecord) -> bool:
+        raise NotImplementedError
+
+    async def save_site_payload(
+        self,
+        *,
+        target: CrawlTarget,
+        pages: list[Any],
+        prices: list[Any],
+        specialists: list[Any],
+        contacts: list[Any],
+        booking_features: dict[str, str],
+    ) -> None:
+        raise NotImplementedError
+
+    def emit_summary(self) -> None:
+        raise NotImplementedError
+
+
+class ListFirmDataSource:
+    def __init__(self, firms: list[dict[str, str]], city_code: str) -> None:
+        self._city_code = city_code
+        self._firms = firms
+
+    async def list_firms(self) -> list[FirmRecord]:
+        return [
+            FirmRecord(
+                firm_id=firm["id"],
+                company_name=firm["name"],
+                address_name=firm["address_name"],
+                firm_card_url=f"https://2gis.ru/{self._city_code}/firm/{firm['id']}",
+            )
+            for firm in self._firms
+        ]
+
+
+class CsvCrawlRepository:
+    def __init__(
+        self,
+        *,
+        output_dir: Path,
+        hh_links_csv: Path,
+        telegram_csv: Path,
+        max_channels_csv: Path,
+        dzen_csv: Path,
+        rutube_csv: Path,
+        vk_csv: Path,
+        drive2_csv: Path,
+        other_links_csv: Path,
+        booking_csv: Path,
+        crawl_status_csv: Path,
+    ) -> None:
+        self.output_dir = output_dir
+        self.hh_links_csv = hh_links_csv
+        self.telegram_csv = telegram_csv
+        self.max_channels_csv = max_channels_csv
+        self.dzen_csv = dzen_csv
+        self.rutube_csv = rutube_csv
+        self.vk_csv = vk_csv
+        self.drive2_csv = drive2_csv
+        self.other_links_csv = other_links_csv
+        self.booking_csv = booking_csv
+        self.crawl_status_csv = crawl_status_csv
+        self._lock = asyncio.Lock()
+
+        self._seen_hh = load_seen_pairs(self.hh_links_csv, "firm_id", "hh_employer_url")
+        self._seen_telegram = load_seen_pairs(self.telegram_csv, "firm_id", "telegram_url")
+        self._seen_max = load_seen_pairs(self.max_channels_csv, "firm_id", "max_channel_url")
+        self._seen_dzen = load_seen_pairs(self.dzen_csv, "firm_id", "dzen_url")
+        self._seen_rutube = load_seen_pairs(self.rutube_csv, "firm_id", "link_url")
+        self._seen_vk = load_seen_pairs(self.vk_csv, "firm_id", "link_url")
+        self._seen_drive2 = load_seen_pairs(self.drive2_csv, "firm_id", "link_url")
+        self._seen_other = load_seen_pairs(self.other_links_csv, "firm_id", "link_url")
+        self._seen_booking = load_seen_pairs(self.booking_csv, "firm_id", "site_url")
+        self._inserted_counts: defaultdict[str, int] = defaultdict(int)
+
+    def _append_unique_row(
+        self,
+        *,
+        csv_path: Path,
+        fieldnames: tuple[str, ...],
+        row: dict[str, str],
+        seen: set[tuple[str, str]],
+        key_field: str,
+        counter_key: str,
+    ) -> bool:
+        key = ((row.get("firm_id") or "").strip(), (row.get(key_field) or "").strip())
+        if not key[0] or not key[1] or key in seen:
+            return False
+        seen.add(key)
+        self._inserted_counts[counter_key] += append_csv_rows(csv_path, fieldnames, [row])
+        return True
+
+    async def record_status(
+        self,
+        *,
+        firm: FirmRecord,
+        stage: str,
+        status: str,
+        site_url: str = "",
+        details: str = "",
+    ) -> None:
+        row = {
+            "firm_id": firm.firm_id,
+            "company_name": firm.company_name,
+            "address_name": firm.address_name,
+            "firm_card_url": firm.firm_card_url,
+            "site_url": site_url,
+            "stage": stage,
+            "status": status,
+            "details": details[:1200],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        async with self._lock:
+            append_csv_rows(self.crawl_status_csv, CRAWL_STATUS_FIELDNAMES, [row])
+
+    async def save_external_link(self, link: ExternalLinkRecord) -> bool:
+        source_with_kind = f"{link.source}_{link.kind}"
+        base_row = {
+            "firm_id": link.firm.firm_id,
+            "company_name": link.firm.company_name,
+            "address_name": link.firm.address_name,
+            "site_url": link.site_url,
+            "link_url": link.link_url,
+            "link_host": link.link_host,
+            "source": source_with_kind,
+        }
+
+        async with self._lock:
+            if link.kind == "hh":
+                row = {
+                    "firm_id": link.firm.firm_id,
+                    "company_name": link.firm.company_name,
+                    "address_name": link.firm.address_name,
+                    "site_url": link.site_url,
+                    "hh_employer_url": link.link_url,
+                    "source": source_with_kind,
+                }
+                return self._append_unique_row(
+                    csv_path=self.hh_links_csv,
+                    fieldnames=HH_LINKS_FIELDNAMES,
+                    row=row,
+                    seen=self._seen_hh,
+                    key_field="hh_employer_url",
+                    counter_key="hh",
+                )
+            if link.kind == "telegram":
+                row = {
+                    "firm_id": link.firm.firm_id,
+                    "company_name": link.firm.company_name,
+                    "address_name": link.firm.address_name,
+                    "site_url": link.site_url,
+                    "telegram_url": link.link_url,
+                    "source": source_with_kind,
+                }
+                return self._append_unique_row(
+                    csv_path=self.telegram_csv,
+                    fieldnames=TELEGRAM_FIELDNAMES,
+                    row=row,
+                    seen=self._seen_telegram,
+                    key_field="telegram_url",
+                    counter_key="telegram",
+                )
+            if link.kind == "max":
+                row = {
+                    "firm_id": link.firm.firm_id,
+                    "company_name": link.firm.company_name,
+                    "address_name": link.firm.address_name,
+                    "site_url": link.site_url,
+                    "max_channel_url": link.link_url,
+                    "source": source_with_kind,
+                }
+                return self._append_unique_row(
+                    csv_path=self.max_channels_csv,
+                    fieldnames=MAX_FIELDNAMES,
+                    row=row,
+                    seen=self._seen_max,
+                    key_field="max_channel_url",
+                    counter_key="max",
+                )
+            if link.kind == "dzen":
+                row = {
+                    "firm_id": link.firm.firm_id,
+                    "company_name": link.firm.company_name,
+                    "address_name": link.firm.address_name,
+                    "site_url": link.site_url,
+                    "dzen_url": link.link_url,
+                    "source": source_with_kind,
+                }
+                return self._append_unique_row(
+                    csv_path=self.dzen_csv,
+                    fieldnames=DZEN_FIELDNAMES,
+                    row=row,
+                    seen=self._seen_dzen,
+                    key_field="dzen_url",
+                    counter_key="dzen",
+                )
+
+            if link.kind == "video":
+                inserted = self._append_unique_row(
+                    csv_path=self.rutube_csv,
+                    fieldnames=RUTUBE_FIELDNAMES,
+                    row=base_row,
+                    seen=self._seen_rutube,
+                    key_field="link_url",
+                    counter_key="video",
+                )
+                self._append_unique_row(
+                    csv_path=self.other_links_csv,
+                    fieldnames=OTHER_LINKS_FIELDNAMES,
+                    row=base_row,
+                    seen=self._seen_other,
+                    key_field="link_url",
+                    counter_key="other",
+                )
+                return inserted
+            if link.kind == "social":
+                inserted = self._append_unique_row(
+                    csv_path=self.vk_csv,
+                    fieldnames=VK_FIELDNAMES,
+                    row=base_row,
+                    seen=self._seen_vk,
+                    key_field="link_url",
+                    counter_key="social",
+                )
+                self._append_unique_row(
+                    csv_path=self.other_links_csv,
+                    fieldnames=OTHER_LINKS_FIELDNAMES,
+                    row=base_row,
+                    seen=self._seen_other,
+                    key_field="link_url",
+                    counter_key="other",
+                )
+                return inserted
+            if link.kind == "drive2":
+                return self._append_unique_row(
+                    csv_path=self.drive2_csv,
+                    fieldnames=DRIVE2_FIELDNAMES,
+                    row=base_row,
+                    seen=self._seen_drive2,
+                    key_field="link_url",
+                    counter_key="drive2",
+                )
+            if link.kind == "other":
+                return self._append_unique_row(
+                    csv_path=self.other_links_csv,
+                    fieldnames=OTHER_LINKS_FIELDNAMES,
+                    row=base_row,
+                    seen=self._seen_other,
+                    key_field="link_url",
+                    counter_key="other",
+                )
+        return False
+
+    async def save_site_payload(
+        self,
+        *,
+        target: CrawlTarget,
+        pages: list[Any],
+        prices: list[Any],
+        specialists: list[Any],
+        contacts: list[Any],
+        booking_features: dict[str, str],
+    ) -> None:
+        domain = domain_slug(target.site_url)
+        site_dir = self.output_dir / domain
+        site_dir.mkdir(parents=True, exist_ok=True)
+        write_pricing_csv(site_dir / "pricing.csv", prices)
+        write_specialists_csv(site_dir / "specialists.csv", specialists)
+        write_contacts_csv(site_dir / "contacts.csv", contacts)
+        self._inserted_counts["sites"] += 1
+
+        if booking_features.get("booking_mode", "none") == "none":
+            return
+
+        row = {
+            "firm_id": target.firm.firm_id,
+            "company_name": target.firm.company_name,
+            "address_name": target.firm.address_name,
+            "site_url": target.site_url,
+            **booking_features,
+        }
+        async with self._lock:
+            self._append_unique_row(
+                csv_path=self.booking_csv,
+                fieldnames=BOOKING_FIELDNAMES,
+                row=row,
+                seen=self._seen_booking,
+                key_field="site_url",
+                counter_key="booking",
+            )
+
+    def emit_summary(self) -> None:
+        logger.info(
+            "Inserted rows -> hh:%s telegram:%s max:%s dzen:%s social:%s video:%s drive2:%s other:%s booking:%s sites:%s",
+            self._inserted_counts["hh"],
+            self._inserted_counts["telegram"],
+            self._inserted_counts["max"],
+            self._inserted_counts["dzen"],
+            self._inserted_counts["social"],
+            self._inserted_counts["video"],
+            self._inserted_counts["drive2"],
+            self._inserted_counts["other"],
+            self._inserted_counts["booking"],
+            self._inserted_counts["sites"],
+        )
+        logger.info("Crawl status CSV: %s", self.crawl_status_csv)
+        logger.info("HH links CSV: %s", self.hh_links_csv)
+        logger.info("Telegram links CSV: %s", self.telegram_csv)
+        logger.info("Max channels CSV: %s", self.max_channels_csv)
+        logger.info("Dzen CSV: %s", self.dzen_csv)
+        logger.info("VK/social CSV: %s", self.vk_csv)
+        logger.info("Video hosting CSV: %s", self.rutube_csv)
+        logger.info("Drive2 CSV: %s", self.drive2_csv)
+        logger.info("Other external links CSV: %s", self.other_links_csv)
+        logger.info("Booking CSV: %s", self.booking_csv)
+
+
+class SiteCrawlerPipeline:
+    def __init__(
+        self,
+        *,
+        data_source: CrawlDataSource,
+        repository: CrawlRepository,
+        config: CrawlPipelineConfig,
+    ) -> None:
+        self._data_source = data_source
+        self._repository = repository
+        self._config = config
+        self._short_url_cache: dict[str, Optional[str]] = {}
+        self._site_redirect_cache: dict[str, Optional[str]] = {}
+        self._seen_origin_domains: set[str] = set()
+        self._failed_attempts: list[str] = []
+        self._failed_seen: set[str] = set()
+
+    async def run(self) -> None:
+        firms = await self._data_source.list_firms()
+        if not firms:
+            return
+
+        crawl_targets = await self._run_preprocess(firms)
+        if not crawl_targets:
+            self._print_failed_attempts()
+            return
+
+        await self._run_crawl(crawl_targets)
+        self._print_failed_attempts()
+
+    async def _run_preprocess(self, firms: list[FirmRecord]) -> list[CrawlTarget]:
+        targets: list[CrawlTarget] = []
+        for index, firm in enumerate(firms, start=1):
+            logger.info("Preprocess firm %s/%s: id=%s name=%s", index, len(firms), firm.firm_id, firm.company_name or "-")
+            try:
+                sites = await asyncio.to_thread(get_firm_sites, self._config.city_code, firm.firm_id)
+            except Exception as exc:
+                logger.exception("Failed to resolve sites for firm_id=%s: %s", firm.firm_id, exc)
+                await self._repository.record_status(
+                    firm=firm,
+                    stage="preprocess",
+                    status="failed",
+                    details=f"get_firm_sites_error: {exc}",
+                )
+                self._mark_failed(firm.firm_card_url)
+                continue
+
+            if not sites:
+                await self._repository.record_status(
+                    firm=firm,
+                    stage="preprocess",
+                    status="failed",
+                    details="no_sites_from_get_firm_sites",
+                )
+                self._mark_failed(firm.firm_card_url)
+                continue
+
+            prepared = await self._prepare_targets_for_firm(firm, sites)
+            targets.extend(prepared)
+        return targets
+
+    async def _prepare_targets_for_firm(self, firm: FirmRecord, sites: list[str]) -> list[CrawlTarget]:
+        seen_in_firm: set[str] = set()
+        crawl_candidates: list[str] = []
+
+        for raw_site in sites:
+            processed_site = raw_site
+            if is_clck_url(raw_site):
+                resolved = await self._resolve_short_url_cached(raw_site)
+                if not resolved:
+                    logger.info("Skip unresolved clck.ru from 2GIS card: firm_id=%s url=%s", firm.firm_id, to_display_url(raw_site))
+                    continue
+                logger.info("Resolved clck.ru from 2GIS card: %s -> %s", to_display_url(raw_site), to_display_url(resolved))
+                processed_site = resolved
+
+            if is_jivo_url(processed_site):
+                logger.info("Skip jivo.chat from 2GIS card: firm_id=%s url=%s", firm.firm_id, to_display_url(processed_site))
+                continue
+
+            direct_social = self._classify_social_link(
+                firm=firm,
+                site_url="",
+                raw_url=processed_site,
+                source="2gis_card",
+            )
+            if direct_social is not None:
+                await self._repository.save_external_link(direct_social)
+                continue
+
+            normalized_site = normalize_site_origin_url(processed_site)
+            if not normalized_site:
+                continue
+
+            resolved_site = await self._resolve_site_redirect_cached(normalized_site) or normalized_site
+            if resolved_site != normalized_site:
+                logger.info(
+                    "Merged site by redirect for firm_id=%s: %s -> %s",
+                    firm.firm_id,
+                    to_display_url(normalized_site),
+                    to_display_url(resolved_site),
+                )
+
+            redirected_social = self._classify_social_link(
+                firm=firm,
+                site_url="",
+                raw_url=resolved_site,
+                source="2gis_card_redirect",
+            )
+            if redirected_social is not None:
+                await self._repository.save_external_link(redirected_social)
+                continue
+
+            if resolved_site in seen_in_firm:
+                continue
+            seen_in_firm.add(resolved_site)
+            crawl_candidates.append(resolved_site)
+
+        selected = crawl_candidates[: max(1, self._config.max_sites_per_firm)]
+        prepared_targets: list[CrawlTarget] = []
+        for site_url in selected:
+            origin_domain = origin_domain_from_url(site_url)
+            target = CrawlTarget(firm=firm, site_url=site_url)
+            if origin_domain and origin_domain in self._seen_origin_domains:
+                await self._repository.record_status(
+                    firm=firm,
+                    stage="preprocess",
+                    status="skipped",
+                    site_url=site_url,
+                    details=f"duplicate_origin_domain={decode_host_from_idna(origin_domain)}",
+                )
+                continue
+            if origin_domain:
+                self._seen_origin_domains.add(origin_domain)
+            prepared_targets.append(target)
+            await self._repository.record_status(
+                firm=firm,
+                stage="preprocess",
+                status="queued",
+                site_url=site_url,
+            )
+
+        if not prepared_targets:
+            await self._repository.record_status(
+                firm=firm,
+                stage="preprocess",
+                status="failed",
+                details="no_crawl_targets_after_filtering",
+            )
+            self._mark_failed(firm.firm_card_url)
+
+        logger.info(
+            "Firm %s preprocess result: raw_sites=%s queued_sites=%s",
+            firm.firm_id,
+            len(sites),
+            len(prepared_targets),
+        )
+        return prepared_targets
+
+    async def _run_crawl(self, crawl_targets: list[CrawlTarget]) -> None:
+        browser_config = build_browser_config()
+        run_config = build_run_config()
+        site_semaphore = asyncio.Semaphore(max(1, self._config.site_concurrency))
+
+        async with create_crawler(browser_config) as crawler:
+            async def _crawl_one(target: CrawlTarget) -> None:
+                async with site_semaphore:
+                    await self._crawl_single_site(crawler=crawler, run_config=run_config, target=target)
+
+            tasks = [asyncio.create_task(_crawl_one(target)) for target in crawl_targets]
+            for task in tasks:
+                await task
+
+    async def _crawl_single_site(self, *, crawler: Any, run_config: Any, target: CrawlTarget) -> None:
+        await self._repository.record_status(
+            firm=target.firm,
+            stage="crawl",
+            status="running",
+            site_url=target.site_url,
+        )
+        try:
+            pages = await crawl_site_pages(
+                crawler=crawler,
+                start_url=target.site_url,
+                max_pages=max(1, self._config.max_pages),
+                run_config=run_config,
+                verbose=self._config.verbose,
+                page_concurrency=max(1, self._config.page_concurrency),
+            )
+        except Exception as exc:
+            logger.exception("Crawler failed for site=%s: %s", to_display_url(target.site_url), exc)
+            await self._repository.record_status(
+                firm=target.firm,
+                stage="crawl",
+                status="failed",
+                site_url=target.site_url,
+                details=f"crawl_exception: {exc}",
+            )
+            self._mark_failed(target.site_url)
+            return
+
+        if not pages:
+            await self._repository.record_status(
+                firm=target.firm,
+                stage="crawl",
+                status="failed",
+                site_url=target.site_url,
+                details="no_pages_collected",
+            )
+            self._mark_failed(target.site_url)
+            return
+
+        domain = domain_slug(target.site_url)
+        prices = extract_prices(pages, domain)
+        specialists = extract_specialists(pages, domain)
+        contacts = extract_contacts(pages, domain)
+        booking_features = detect_booking_features(pages, target.site_url)
+        await self._repository.save_site_payload(
+            target=target,
+            pages=pages,
+            prices=prices,
+            specialists=specialists,
+            contacts=contacts,
+            booking_features=booking_features,
+        )
+
+        link_counts = await self._extract_external_links(target=target, pages=pages)
+        details = (
+            f"pages={len(pages)} prices={len(prices)} specialists={len(specialists)} contacts={len(contacts)} "
+            f"booking={booking_features.get('booking_mode', 'none')} links={dict(link_counts)}"
+        )
+        await self._repository.record_status(
+            firm=target.firm,
+            stage="crawl",
+            status="success",
+            site_url=target.site_url,
+            details=details,
+        )
+        logger.info("SUCCESS: %s | %s", to_display_url(target.site_url), details)
+
+    async def _extract_external_links(self, *, target: CrawlTarget, pages: list[Any]) -> dict[str, int]:
+        counts: defaultdict[str, int] = defaultdict(int)
+        for source_page_url, raw_link in extract_page_links(pages):
+            processed_link = raw_link
+            if is_clck_url(raw_link):
+                resolved = await self._resolve_short_url_cached(raw_link)
+                if not resolved:
+                    logger.info("Skip unresolved clck.ru from site crawl: %s", to_display_url(raw_link))
+                    continue
+                processed_link = resolved
+
+            if is_jivo_url(processed_link):
+                continue
+            if has_invalid_http_port(processed_link):
+                logger.warning(
+                    "Skip malformed link with invalid port: firm_id=%s site=%s source_page=%s link=%s",
+                    target.firm.firm_id,
+                    to_display_url(target.site_url),
+                    to_display_url(source_page_url),
+                    processed_link,
+                )
+                continue
+
+            social_link = self._classify_social_link(
+                firm=target.firm,
+                site_url=target.site_url,
+                raw_url=processed_link,
+                source="site_crawl",
+            )
+            if social_link is not None:
+                if await self._repository.save_external_link(social_link):
+                    counts[social_link.kind] += 1
+                continue
+
+            normalized = normalize_http_url(processed_link)
+            if not normalized:
+                continue
+            if is_internal_for_site(normalized, target.site_url):
+                continue
+
+            other_link = ExternalLinkRecord(
+                firm=target.firm,
+                site_url=target.site_url,
+                link_url=normalized,
+                link_host=normalize_host_for_url(urlsplit(normalized).hostname or ""),
+                kind="other",
+                source="site_crawl",
+            )
+            if await self._repository.save_external_link(other_link):
+                counts["other"] += 1
+        return dict(counts)
+
+    def _classify_social_link(
+        self,
+        *,
+        firm: FirmRecord,
+        site_url: str,
+        raw_url: str,
+        source: str,
+    ) -> Optional[ExternalLinkRecord]:
+        hh_url = normalize_hh_employer_url(raw_url)
+        if hh_url:
+            return self._build_external_link(firm=firm, site_url=site_url, link_url=hh_url, kind="hh", source=source)
+
+        max_url = normalize_max_channel_url(raw_url)
+        if max_url:
+            return self._build_external_link(firm=firm, site_url=site_url, link_url=max_url, kind="max", source=source)
+
+        telegram_url = normalize_telegram_url(raw_url)
+        if telegram_url:
+            return self._build_external_link(
+                firm=firm,
+                site_url=site_url,
+                link_url=telegram_url,
+                kind="telegram",
+                source=source,
+            )
+
+        dzen_url = normalize_dzen_url(raw_url)
+        if dzen_url:
+            return self._build_external_link(
+                firm=firm,
+                site_url=site_url,
+                link_url=dzen_url,
+                kind="dzen",
+                source=source,
+            )
+
+        normalized = normalize_http_url(raw_url)
+        if not normalized:
+            return None
+        platform_kind = classify_platform_url(normalized)
+        if platform_kind == "drive2":
+            return self._build_external_link(
+                firm=firm,
+                site_url=site_url,
+                link_url=normalized,
+                kind="drive2",
+                source=source,
+            )
+        if platform_kind == "video_hosting":
+            return self._build_external_link(
+                firm=firm,
+                site_url=site_url,
+                link_url=normalized,
+                kind="video",
+                source=source,
+            )
+        if platform_kind == "social_network":
+            return self._build_external_link(
+                firm=firm,
+                site_url=site_url,
+                link_url=normalized,
+                kind="social",
+                source=source,
+            )
+        return None
+
+    def _build_external_link(
+        self,
+        *,
+        firm: FirmRecord,
+        site_url: str,
+        link_url: str,
+        kind: str,
+        source: str,
+    ) -> ExternalLinkRecord:
+        return ExternalLinkRecord(
+            firm=firm,
+            site_url=site_url,
+            link_url=link_url,
+            link_host=normalize_host_for_url(urlsplit(link_url).hostname or ""),
+            kind=kind,
+            source=source,
+        )
+
+    async def _resolve_short_url_cached(self, raw_url: str) -> Optional[str]:
+        key = raw_url.strip()
+        if key in self._short_url_cache:
+            return self._short_url_cache[key]
+        resolved = await asyncio.to_thread(resolve_short_url, key)
+        self._short_url_cache[key] = resolved
+        return resolved
+
+    async def _resolve_site_redirect_cached(self, raw_url: str) -> Optional[str]:
+        normalized = normalize_site_origin_url(raw_url)
+        if not normalized:
+            return None
+        if normalized in self._site_redirect_cache:
+            return self._site_redirect_cache[normalized]
+        resolved = await asyncio.to_thread(resolve_site_redirect, normalized)
+        self._site_redirect_cache[normalized] = resolved
+        return resolved
+
+    def _mark_failed(self, value: str) -> None:
+        if value in self._failed_seen:
+            return
+        self._failed_seen.add(value)
+        self._failed_attempts.append(value)
+
+    def _print_failed_attempts(self) -> None:
+        if self._failed_attempts:
+            print("\nFailed attempts:")
+            for value in self._failed_attempts:
+                print(value)
+            return
+        print("\nFailed attempts: none")
+
+
 async def run_streaming(
     firms: list[dict[str, str]],
     city_code: str,
@@ -759,639 +1549,40 @@ async def run_streaming(
     drive2_csv: Path,
     other_links_csv: Path,
     booking_csv: Path,
+    crawl_status_csv: Path,
     verbose: bool,
     site_concurrency: int,
     page_concurrency: int,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    browser_config = build_browser_config()
-    run_config = build_run_config()
-
-    failed_attempts: list[str] = []
-    seen_hh = load_seen_pairs(hh_links_csv, "firm_id", "hh_employer_url")
-    seen_telegram = load_seen_pairs(telegram_csv, "firm_id", "telegram_url")
-    seen_max = load_seen_pairs(max_channels_csv, "firm_id", "max_channel_url")
-    seen_dzen = load_seen_pairs(dzen_csv, "firm_id", "dzen_url")
-    seen_rutube = load_seen_pairs(rutube_csv, "firm_id", "link_url")
-    seen_vk = load_seen_pairs(vk_csv, "firm_id", "link_url")
-    seen_drive2 = load_seen_pairs(drive2_csv, "firm_id", "link_url")
-    seen_other = load_seen_pairs(other_links_csv, "firm_id", "link_url")
-    seen_booking = load_seen_pairs(booking_csv, "firm_id", "site_url")
-    seen_crawled_origins: set[str] = set()
-    short_url_cache: dict[str, Optional[str]] = {}
-    site_redirect_cache: dict[str, Optional[str]] = {}
-    appended_hh_rows = 0
-    appended_telegram_rows = 0
-    appended_max_rows = 0
-    appended_dzen_rows = 0
-    appended_rutube_rows = 0
-    appended_vk_rows = 0
-    appended_drive2_rows = 0
-    appended_other_rows = 0
-    appended_booking_rows = 0
-
-    async def resolve_short_url_cached(raw_url: str) -> Optional[str]:
-        key = raw_url.strip()
-        cached = short_url_cache.get(key)
-        if cached is not None or key in short_url_cache:
-            return cached
-        resolved = await asyncio.to_thread(resolve_short_url, key)
-        short_url_cache[key] = resolved
-        return resolved
-
-    async def resolve_site_redirect_cached(raw_url: str) -> Optional[str]:
-        normalized = normalize_site_origin_url(raw_url)
-        if not normalized:
-            return None
-        cached = site_redirect_cache.get(normalized)
-        if cached is not None or normalized in site_redirect_cache:
-            return cached
-        resolved = await asyncio.to_thread(resolve_site_redirect, normalized)
-        site_redirect_cache[normalized] = resolved
-        return resolved
-
-    def append_hh_row(row: dict[str, str]) -> bool:
-        nonlocal appended_hh_rows
-        key = ((row.get("firm_id") or "").strip(), (row.get("hh_employer_url") or "").strip())
-        if not key[0] or not key[1] or key in seen_hh:
-            return False
-        seen_hh.add(key)
-        appended_hh_rows += append_csv_rows(hh_links_csv, HH_LINKS_FIELDNAMES, [row])
-        return True
-
-    def append_telegram_row(row: dict[str, str]) -> bool:
-        nonlocal appended_telegram_rows
-        key = ((row.get("firm_id") or "").strip(), (row.get("telegram_url") or "").strip())
-        if not key[0] or not key[1] or key in seen_telegram:
-            return False
-        seen_telegram.add(key)
-        appended_telegram_rows += append_csv_rows(telegram_csv, TELEGRAM_FIELDNAMES, [row])
-        return True
-
-    def append_max_row(row: dict[str, str]) -> bool:
-        nonlocal appended_max_rows
-        key = ((row.get("firm_id") or "").strip(), (row.get("max_channel_url") or "").strip())
-        if not key[0] or not key[1] or key in seen_max:
-            return False
-        seen_max.add(key)
-        appended_max_rows += append_csv_rows(max_channels_csv, MAX_FIELDNAMES, [row])
-        return True
-
-    def append_dzen_row(row: dict[str, str]) -> bool:
-        nonlocal appended_dzen_rows
-        key = ((row.get("firm_id") or "").strip(), (row.get("dzen_url") or "").strip())
-        if not key[0] or not key[1] or key in seen_dzen:
-            return False
-        seen_dzen.add(key)
-        appended_dzen_rows += append_csv_rows(dzen_csv, DZEN_FIELDNAMES, [row])
-        return True
-
-    def append_other_row(row: dict[str, str]) -> bool:
-        nonlocal appended_other_rows
-        key = ((row.get("firm_id") or "").strip(), (row.get("link_url") or "").strip())
-        if not key[0] or not key[1] or key in seen_other:
-            return False
-        seen_other.add(key)
-        appended_other_rows += append_csv_rows(other_links_csv, OTHER_LINKS_FIELDNAMES, [row])
-        return True
-
-    def append_rutube_row(row: dict[str, str]) -> bool:
-        nonlocal appended_rutube_rows
-        key = ((row.get("firm_id") or "").strip(), (row.get("link_url") or "").strip())
-        if not key[0] or not key[1] or key in seen_rutube:
-            return False
-        seen_rutube.add(key)
-        appended_rutube_rows += append_csv_rows(rutube_csv, RUTUBE_FIELDNAMES, [row])
-        return True
-
-    def append_vk_row(row: dict[str, str]) -> bool:
-        nonlocal appended_vk_rows
-        key = ((row.get("firm_id") or "").strip(), (row.get("link_url") or "").strip())
-        if not key[0] or not key[1] or key in seen_vk:
-            return False
-        seen_vk.add(key)
-        appended_vk_rows += append_csv_rows(vk_csv, VK_FIELDNAMES, [row])
-        return True
-
-    def append_drive2_row(row: dict[str, str]) -> bool:
-        nonlocal appended_drive2_rows
-        key = ((row.get("firm_id") or "").strip(), (row.get("link_url") or "").strip())
-        if not key[0] or not key[1] or key in seen_drive2:
-            return False
-        seen_drive2.add(key)
-        appended_drive2_rows += append_csv_rows(drive2_csv, DRIVE2_FIELDNAMES, [row])
-        return True
-
-    def append_booking_row(row: dict[str, str]) -> bool:
-        nonlocal appended_booking_rows
-        key = ((row.get("firm_id") or "").strip(), (row.get("site_url") or "").strip())
-        if not key[0] or not key[1] or key in seen_booking:
-            return False
-        seen_booking.add(key)
-        appended_booking_rows += append_csv_rows(booking_csv, BOOKING_FIELDNAMES, [row])
-        return True
-
-    def append_platform_link(
-        *,
-        firm_id_value: str,
-        company_name_value: str,
-        address_name_value: str,
-        site_url_value: str,
-        link_url_value: str,
-        source_value: str,
-        platform_kind: str,
-    ) -> bool:
-        normalized_link = normalize_http_url(link_url_value)
-        if not normalized_link:
-            return False
-        host = normalize_host_for_url(urlsplit(normalized_link).hostname or "")
-        base_row = {
-            "firm_id": firm_id_value,
-            "company_name": company_name_value,
-            "address_name": address_name_value,
-            "site_url": site_url_value,
-            "link_url": normalized_link,
-            "link_host": host,
-            "source": f"{source_value}_{platform_kind}",
-        }
-        if platform_kind == "video_hosting":
-            inserted = append_rutube_row(base_row)
-        elif platform_kind == "drive2":
-            inserted = append_drive2_row(base_row)
-        else:
-            inserted = append_vk_row(base_row)
-        if platform_kind != "drive2":
-            append_other_row(base_row)
-        return inserted
-
-    async with create_crawler(browser_config) as crawler:
-        for index, firm in enumerate(firms, start=1):
-            firm_id = firm["id"]
-            company_name = firm["name"]
-            address_name = firm["address_name"]
-
-            logger.info("Firm %s/%s: id=%s name=%s", index, len(firms), firm_id, company_name or "-")
-
-            try:
-                sites = await asyncio.to_thread(get_firm_sites, city_code, firm_id)
-            except Exception as exc:
-                logger.exception("Failed to resolve sites for firm_id=%s: %s", firm_id, exc)
-                failed_attempts.append(f"https://2gis.ru/{city_code}/firm/{firm_id}")
-                continue
-
-            if not sites:
-                logger.info("No sites found for firm_id=%s", firm_id)
-                failed_attempts.append(f"https://2gis.ru/{city_code}/firm/{firm_id}")
-                continue
-
-            normalized_sites: list[str] = []
-            seen_in_firm: set[str] = set()
-            for raw_site in sites:
-                processed_site = raw_site
-                if is_clck_url(raw_site):
-                    resolved = await resolve_short_url_cached(raw_site)
-                    if not resolved:
-                        logger.info(
-                            "Skip unresolved clck.ru link from 2GIS card for firm_id=%s: %s",
-                            firm_id,
-                            to_display_url(raw_site),
-                        )
-                        continue
-                    logger.info(
-                        "Resolved clck.ru from 2GIS card: %s -> %s",
-                        to_display_url(raw_site),
-                        to_display_url(resolved),
-                    )
-                    processed_site = resolved
-
-                if is_jivo_url(processed_site):
-                    logger.info(
-                        "Skip jivo.chat link from 2GIS card for firm_id=%s: %s",
-                        firm_id,
-                        to_display_url(processed_site),
-                    )
-                    continue
-
-                platform_kind = classify_platform_url(processed_site)
-                if platform_kind is not None:
-                    append_platform_link(
-                        firm_id_value=firm_id,
-                        company_name_value=company_name,
-                        address_name_value=address_name,
-                        site_url_value="",
-                        link_url_value=processed_site,
-                        source_value="2gis_card",
-                        platform_kind=platform_kind,
-                    )
-                    continue
-
-                if is_max_url(processed_site):
-                    max_url = normalize_max_channel_url(processed_site)
-                    if max_url:
-                        append_max_row(
-                            {
-                                "firm_id": firm_id,
-                                "company_name": company_name,
-                                "address_name": address_name,
-                                "site_url": "",
-                                "max_channel_url": max_url,
-                                "source": "2gis_card",
-                            }
-                        )
-                    else:
-                        logger.info(
-                            "Skip max.ru link from 2GIS card for firm_id=%s: %s",
-                            firm_id,
-                            to_display_url(processed_site),
-                        )
-                    continue
-
-                if is_hh_url(processed_site):
-                    hh_url = normalize_hh_employer_url(processed_site)
-                    if hh_url:
-                        append_hh_row(
-                            {
-                                "firm_id": firm_id,
-                                "company_name": company_name,
-                                "address_name": address_name,
-                                "site_url": "",
-                                "hh_employer_url": hh_url,
-                                "source": "2gis_card",
-                            }
-                        )
-                    continue
-
-                telegram_url = normalize_telegram_url(processed_site)
-                if telegram_url:
-                    append_telegram_row(
-                        {
-                            "firm_id": firm_id,
-                            "company_name": company_name,
-                            "address_name": address_name,
-                            "site_url": "",
-                            "telegram_url": telegram_url,
-                            "source": "2gis_card",
-                        }
-                    )
-                    continue
-
-                dzen_url = normalize_dzen_url(processed_site)
-                if dzen_url:
-                    append_dzen_row(
-                        {
-                            "firm_id": firm_id,
-                            "company_name": company_name,
-                            "address_name": address_name,
-                            "site_url": "",
-                            "dzen_url": dzen_url,
-                            "source": "2gis_card",
-                        }
-                    )
-                    continue
-
-                normalized = normalize_site_origin_url(processed_site)
-                if not normalized:
-                    continue
-                resolved_site = await resolve_site_redirect_cached(normalized) or normalized
-                if resolved_site != normalized:
-                    logger.info(
-                        "Merged site by redirect for firm_id=%s: %s -> %s",
-                        firm_id,
-                        to_display_url(normalized),
-                        to_display_url(resolved_site),
-                    )
-
-                platform_kind = classify_platform_url(resolved_site)
-                if platform_kind is not None:
-                    append_platform_link(
-                        firm_id_value=firm_id,
-                        company_name_value=company_name,
-                        address_name_value=address_name,
-                        site_url_value="",
-                        link_url_value=resolved_site,
-                        source_value="2gis_card_redirect",
-                        platform_kind=platform_kind,
-                    )
-                    continue
-
-                if is_max_url(resolved_site):
-                    max_url = normalize_max_channel_url(resolved_site)
-                    if max_url:
-                        append_max_row(
-                            {
-                                "firm_id": firm_id,
-                                "company_name": company_name,
-                                "address_name": address_name,
-                                "site_url": "",
-                                "max_channel_url": max_url,
-                                "source": "2gis_card_redirect",
-                            }
-                        )
-                    continue
-                if is_hh_url(resolved_site):
-                    hh_url = normalize_hh_employer_url(resolved_site)
-                    if hh_url:
-                        append_hh_row(
-                            {
-                                "firm_id": firm_id,
-                                "company_name": company_name,
-                                "address_name": address_name,
-                                "site_url": "",
-                                "hh_employer_url": hh_url,
-                                "source": "2gis_card_redirect",
-                            }
-                        )
-                    continue
-                telegram_url = normalize_telegram_url(resolved_site)
-                if telegram_url:
-                    append_telegram_row(
-                        {
-                            "firm_id": firm_id,
-                            "company_name": company_name,
-                            "address_name": address_name,
-                            "site_url": "",
-                            "telegram_url": telegram_url,
-                            "source": "2gis_card_redirect",
-                        }
-                    )
-                    continue
-                dzen_url = normalize_dzen_url(resolved_site)
-                if dzen_url:
-                    append_dzen_row(
-                        {
-                            "firm_id": firm_id,
-                            "company_name": company_name,
-                            "address_name": address_name,
-                            "site_url": "",
-                            "dzen_url": dzen_url,
-                            "source": "2gis_card_redirect",
-                        }
-                    )
-                    continue
-
-                if resolved_site in seen_in_firm:
-                    continue
-                seen_in_firm.add(resolved_site)
-                normalized_sites.append(resolved_site)
-
-            selected_sites = normalized_sites[: max(1, max_sites_per_firm)]
-            logger.info(
-                "Resolved %s raw site(s), selected for crawl: %s",
-                len(sites),
-                [to_display_url(site) for site in selected_sites],
-            )
-
-            site_semaphore = asyncio.Semaphore(max(1, site_concurrency))
-
-            async def process_site_url(site_url: str) -> None:
-                if is_hh_url(site_url):
-                    return
-                platform_kind = classify_platform_url(site_url)
-                if platform_kind is not None:
-                    logger.info(
-                        "Skip %s site crawl for firm_id=%s: %s",
-                        platform_kind,
-                        firm_id,
-                        to_display_url(site_url),
-                    )
-                    return
-                if is_max_url(site_url):
-                    logger.info("Skip max.ru site crawl for firm_id=%s: %s", firm_id, to_display_url(site_url))
-                    return
-                if is_dzen_url(site_url):
-                    logger.info("Skip dzen site crawl for firm_id=%s: %s", firm_id, to_display_url(site_url))
-                    return
-
-                origin_domain = origin_domain_from_url(site_url)
-                if origin_domain and origin_domain in seen_crawled_origins:
-                    logger.info(
-                        "Skip duplicate origin domain crawl for firm_id=%s: %s (origin=%s)",
-                        firm_id,
-                        to_display_url(site_url),
-                        decode_host_from_idna(origin_domain),
-                    )
-                    return
-                if origin_domain:
-                    seen_crawled_origins.add(origin_domain)
-
-                async with site_semaphore:
-                    try:
-                        pages = await crawl_site_pages(
-                            crawler=crawler,
-                            start_url=site_url,
-                            max_pages=max_pages,
-                            run_config=run_config,
-                            verbose=verbose,
-                            page_concurrency=max(1, page_concurrency),
-                        )
-                    except Exception as exc:
-                        logger.exception("Crawler failed for site=%s: %s", to_display_url(site_url), exc)
-                        failed_attempts.append(to_display_url(site_url))
-                        return
-
-                if not pages:
-                    logger.warning("No pages collected for site=%s", to_display_url(site_url))
-                    failed_attempts.append(to_display_url(site_url))
-                    return
-
-                domain = domain_slug(site_url)
-                site_dir = output_dir / domain
-                site_dir.mkdir(parents=True, exist_ok=True)
-
-                prices = extract_prices(pages, domain)
-                specialists = extract_specialists(pages, domain)
-                contacts = extract_contacts(pages, domain)
-                write_pricing_csv(site_dir / "pricing.csv", prices)
-                write_specialists_csv(site_dir / "specialists.csv", specialists)
-                write_contacts_csv(site_dir / "contacts.csv", contacts)
-                booking_features = detect_booking_features(pages, site_url)
-                if booking_features["booking_mode"] != "none":
-                    append_booking_row(
-                        {
-                            "firm_id": firm_id,
-                            "company_name": company_name,
-                            "address_name": address_name,
-                            "site_url": site_url,
-                            **booking_features,
-                        }
-                    )
-
-                extracted_hh_count = 0
-                extracted_telegram_count = 0
-                extracted_max_count = 0
-                extracted_dzen_count = 0
-                extracted_other_count = 0
-                for source_page_url, link in extract_page_links(pages):
-                    processed_link = link
-                    if is_clck_url(link):
-                        resolved = await resolve_short_url_cached(link)
-                        if not resolved:
-                            logger.info("Skip unresolved clck.ru link from site crawl: %s", to_display_url(link))
-                            continue
-                        logger.info(
-                            "Resolved clck.ru from site crawl: %s -> %s",
-                            to_display_url(link),
-                            to_display_url(resolved),
-                        )
-                        processed_link = resolved
-
-                    if is_jivo_url(processed_link):
-                        logger.info("Skip jivo.chat link from site crawl: %s", to_display_url(processed_link))
-                        continue
-
-                    if has_invalid_http_port(processed_link):
-                        logger.warning(
-                            "Skip malformed link with invalid port: firm_id=%s site=%s source_page=%s link=%s raw_link=%s",
-                            firm_id,
-                            to_display_url(site_url),
-                            to_display_url(source_page_url),
-                            to_display_url(processed_link),
-                            processed_link,
-                        )
-                        continue
-
-                    platform_kind = classify_platform_url(processed_link)
-                    if platform_kind is not None:
-                        append_platform_link(
-                            firm_id_value=firm_id,
-                            company_name_value=company_name,
-                            address_name_value=address_name,
-                            site_url_value=site_url,
-                            link_url_value=processed_link,
-                            source_value="site_crawl",
-                            platform_kind=platform_kind,
-                        )
-                        continue
-
-                    hh_url = normalize_hh_employer_url(processed_link)
-                    if hh_url:
-                        if append_hh_row(
-                            {
-                                "firm_id": firm_id,
-                                "company_name": company_name,
-                                "address_name": address_name,
-                                "site_url": site_url,
-                                "hh_employer_url": hh_url,
-                                "source": "site_crawl",
-                            }
-                        ):
-                            extracted_hh_count += 1
-                        continue
-
-                    max_url = normalize_max_channel_url(processed_link)
-                    if max_url:
-                        if append_max_row(
-                            {
-                                "firm_id": firm_id,
-                                "company_name": company_name,
-                                "address_name": address_name,
-                                "site_url": site_url,
-                                "max_channel_url": max_url,
-                                "source": "site_crawl",
-                            }
-                        ):
-                            extracted_max_count += 1
-                        continue
-
-                    telegram_url = normalize_telegram_url(processed_link)
-                    if telegram_url:
-                        if append_telegram_row(
-                            {
-                                "firm_id": firm_id,
-                                "company_name": company_name,
-                                "address_name": address_name,
-                                "site_url": site_url,
-                                "telegram_url": telegram_url,
-                                "source": "site_crawl",
-                            }
-                        ):
-                            extracted_telegram_count += 1
-                        continue
-
-                    dzen_url = normalize_dzen_url(processed_link)
-                    if dzen_url:
-                        if append_dzen_row(
-                            {
-                                "firm_id": firm_id,
-                                "company_name": company_name,
-                                "address_name": address_name,
-                                "site_url": site_url,
-                                "dzen_url": dzen_url,
-                                "source": "site_crawl",
-                            }
-                        ):
-                            extracted_dzen_count += 1
-                        continue
-
-                    normalized_link = normalize_http_url(processed_link)
-                    if not normalized_link:
-                        continue
-                    if is_internal_for_site(normalized_link, site_url):
-                        continue
-
-                    if append_other_row(
-                        {
-                            "firm_id": firm_id,
-                            "company_name": company_name,
-                            "address_name": address_name,
-                            "site_url": site_url,
-                            "link_url": normalized_link,
-                            "link_host": normalize_host_for_url(urlsplit(normalized_link).hostname or ""),
-                            "source": "site_crawl",
-                        }
-                    ):
-                        extracted_other_count += 1
-
-                logger.info(
-                    "SUCCESS: %s | pages=%s prices=%s specialists=%s contacts=%s booking_mode=%s has_form=%s has_widget=%s providers=%s hh_employer_links=%s telegram_links=%s max_channels=%s dzen_links=%s other_links=%s -> %s",
-                    to_display_url(site_url),
-                    len(pages),
-                    len(prices),
-                    len(specialists),
-                    len(contacts),
-                    booking_features["booking_mode"],
-                    booking_features["has_booking_form"],
-                    booking_features["has_booking_widget"],
-                    booking_features["booking_widget_provider"] or "-",
-                    extracted_hh_count,
-                    extracted_telegram_count,
-                    extracted_max_count,
-                    extracted_dzen_count,
-                    extracted_other_count,
-                    site_dir,
-                )
-
-            tasks = [asyncio.create_task(process_site_url(site_url)) for site_url in selected_sites]
-            for task in tasks:
-                await task
-    logger.info(
-        "Appended rows this run -> hh:%s telegram:%s max:%s dzen:%s vk:%s rutube:%s drive2:%s other:%s booking:%s",
-        appended_hh_rows,
-        appended_telegram_rows,
-        appended_max_rows,
-        appended_dzen_rows,
-        appended_vk_rows,
-        appended_rutube_rows,
-        appended_drive2_rows,
-        appended_other_rows,
-        appended_booking_rows,
+    data_source = ListFirmDataSource(firms=firms, city_code=city_code)
+    repository = CsvCrawlRepository(
+        output_dir=output_dir,
+        hh_links_csv=hh_links_csv,
+        telegram_csv=telegram_csv,
+        max_channels_csv=max_channels_csv,
+        dzen_csv=dzen_csv,
+        rutube_csv=rutube_csv,
+        vk_csv=vk_csv,
+        drive2_csv=drive2_csv,
+        other_links_csv=other_links_csv,
+        booking_csv=booking_csv,
+        crawl_status_csv=crawl_status_csv,
     )
-    logger.info("HH links CSV: %s", hh_links_csv)
-    logger.info("Telegram links CSV: %s", telegram_csv)
-    logger.info("Max channel links CSV: %s", max_channels_csv)
-    logger.info("Dzen links CSV: %s", dzen_csv)
-    logger.info("VK/social links CSV: %s", vk_csv)
-    logger.info("Rutube/video links CSV: %s", rutube_csv)
-    logger.info("Drive2 links CSV: %s", drive2_csv)
-    logger.info("Other links CSV: %s", other_links_csv)
-    logger.info("Booking features CSV: %s", booking_csv)
-
-    if failed_attempts:
-        print("\nFailed attempts:")
-        for value in failed_attempts:
-            print(value)
-    else:
-        print("\nFailed attempts: none")
+    pipeline = SiteCrawlerPipeline(
+        data_source=data_source,
+        repository=repository,
+        config=CrawlPipelineConfig(
+            city_code=city_code,
+            max_sites_per_firm=max(1, max_sites_per_firm),
+            max_pages=max(1, max_pages),
+            site_concurrency=max(1, site_concurrency),
+            page_concurrency=max(1, page_concurrency),
+            verbose=verbose,
+        ),
+    )
+    await pipeline.run()
+    repository.emit_summary()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1451,6 +1642,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="output/booking_features.csv",
         help="CSV file with booking form/widget detection per crawled site.",
     )
+    parser.add_argument(
+        "--crawl-status-csv",
+        default="output/crawl_status.csv",
+        help="CSV file with queue/crawl statuses per site.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Verbose crawling progress.")
     return parser
 
@@ -1494,6 +1690,7 @@ def main() -> None:
             drive2_csv=Path(args.drive2_csv),
             other_links_csv=Path(args.other_links_csv),
             booking_csv=Path(args.booking_csv),
+            crawl_status_csv=Path(args.crawl_status_csv),
             verbose=args.verbose,
             site_concurrency=max(1, args.site_concurrency),
             page_concurrency=max(1, args.page_concurrency),
