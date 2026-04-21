@@ -113,6 +113,154 @@ def _fetch_rendered_html(url: str, timeout_seconds: int) -> str:
         raise BoNalogScraperError(f"Failed to render page with Playwright: {exc}") from exc
 
 
+def _open_playwright_page(url: str, timeout_seconds: int):
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise BoNalogScraperError(
+            "Playwright is not installed. Install it with "
+            "'uv run playwright install chromium'."
+        ) from exc
+
+    timeout_ms = timeout_seconds * 1000
+    try:
+        playwright_ctx = sync_playwright().start()
+        browser = playwright_ctx.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=USER_AGENT,
+            locale="ru-RU",
+        )
+        page = context.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        try:
+            page.wait_for_load_state("networkidle", timeout=timeout_ms)
+        except PlaywrightTimeoutError:
+            pass
+        page.wait_for_timeout(800)
+    except Exception as exc:
+        raise BoNalogScraperError(f"Failed to render page with Playwright: {exc}") from exc
+    return playwright_ctx, browser, context, page
+
+
+def _discover_year_tabs(page) -> list[int]:
+    years = page.evaluate(
+        """
+        () => {
+          const strictYear = /^(19|20)\\d{2}$/;
+          const periodYear = /[?&]period=((19|20)\\d{2})(?:&|$)/i;
+          const out = [];
+          const seen = new Set();
+
+          const pushYear = (value) => {
+            const year = Number(value);
+            if (!Number.isInteger(year)) return;
+            if (year < 1990 || year > 2100) return;
+            if (seen.has(year)) return;
+            seen.add(year);
+            out.push(year);
+          };
+
+          for (const node of document.querySelectorAll("*")) {
+            const text = (node.textContent || "").replace(/\\s+/g, " ").trim();
+            if (strictYear.test(text)) pushYear(text);
+
+            if (node instanceof HTMLAnchorElement) {
+              const href = node.getAttribute("href") || "";
+              const m = href.match(periodYear);
+              if (m) pushYear(m[1]);
+            }
+
+            for (const attr of ["data-year", "data-period", "aria-label", "title"]) {
+              const value = node.getAttribute?.(attr);
+              if (!value) continue;
+              const cleaned = value.replace(/\\s+/g, " ").trim();
+              if (strictYear.test(cleaned)) pushYear(cleaned);
+              const m = cleaned.match(periodYear);
+              if (m) pushYear(m[1]);
+            }
+          }
+          return out;
+        }
+        """
+    )
+    return sorted({int(item) for item in years if isinstance(item, (int, float))}, reverse=True)
+
+
+def _click_year_tab(page, year: int, timeout_ms: int) -> bool:
+    try:
+        clicked = page.evaluate(
+            """
+            (year) => {
+              const yr = String(year);
+              const strictYear = new RegExp(`^\\\\s*${yr}\\\\s*$`);
+              const periodYear = new RegExp(`[?&]period=${yr}(?:&|$)`, "i");
+
+              const isVisible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === "none" || style.visibility === "hidden") return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
+
+              const score = (el) => {
+                let s = 0;
+                const text = (el.textContent || "").replace(/\\s+/g, " ").trim();
+                if (strictYear.test(text)) s += 5;
+                if (el.matches("button,[role='tab'],a")) s += 3;
+                if (el.closest("[role='tablist'],.tabs,.tab,.nav")) s += 2;
+                for (const attr of ["data-year", "data-period", "aria-label", "title", "href"]) {
+                  const val = el.getAttribute?.(attr);
+                  if (!val) continue;
+                  const cleaned = val.replace(/\\s+/g, " ").trim();
+                  if (strictYear.test(cleaned)) s += 4;
+                  if (periodYear.test(cleaned)) s += 4;
+                }
+                return s;
+              };
+
+              const candidates = [];
+              for (const el of document.querySelectorAll("*")) {
+                const text = (el.textContent || "").replace(/\\s+/g, " ").trim();
+                let matched = strictYear.test(text);
+                if (!matched) {
+                  for (const attr of ["data-year", "data-period", "aria-label", "title", "href"]) {
+                    const val = el.getAttribute?.(attr);
+                    if (!val) continue;
+                    const cleaned = val.replace(/\\s+/g, " ").trim();
+                    if (strictYear.test(cleaned) || periodYear.test(cleaned)) {
+                      matched = true;
+                      break;
+                    }
+                  }
+                }
+                if (matched) candidates.push(el);
+              }
+              if (!candidates.length) return false;
+
+              candidates.sort((a, b) => score(b) - score(a));
+              const target = candidates.find((el) => isVisible(el)) || candidates[0];
+              if (!target) return false;
+
+              const clickable = target.closest("button,[role='tab'],a,[onclick]") || target;
+              clickable.scrollIntoView({block: "center", inline: "center"});
+              clickable.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true, view: window}));
+              if (typeof clickable.click === "function") clickable.click();
+              return true;
+            }
+            """,
+            year,
+        )
+    except Exception:
+        return False
+
+    if not clicked:
+        return False
+    page.wait_for_timeout(min(timeout_ms, 900))
+    return True
+
+
 def _has_section_ancestor(tag: Tag, section_title: str) -> bool:
     section_key = _normalize(section_title).casefold()
     current = tag
@@ -306,6 +454,63 @@ def scrape_revenue(
     return rendered_result if rendered_result.value_raw is not None else result
 
 
+def scrape_revenue_all_years(
+    url: str,
+    section_title: str = DEFAULT_SECTION_TITLE,
+    field_label: str = DEFAULT_FIELD_LABEL,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+) -> list[RevenueResult]:
+    timeout_ms = timeout_seconds * 1000
+    playwright_ctx, browser, context, page = _open_playwright_page(url, timeout_seconds)
+    try:
+        results_by_year: dict[int, RevenueResult] = {}
+
+        html = page.content()
+        first = _extract_from_html(
+            html=html,
+            url=url,
+            section_title=section_title,
+            field_label=field_label,
+            source="playwright",
+        )
+        if first.year is not None:
+            results_by_year[first.year] = first
+
+        years = _discover_year_tabs(page)
+        for year in years:
+            if not _click_year_tab(page, year, timeout_ms):
+                continue
+            parsed = _extract_from_html(
+                html=page.content(),
+                url=url,
+                section_title=section_title,
+                field_label=field_label,
+                source="playwright",
+            )
+            if parsed.year is None:
+                parsed = RevenueResult(
+                    url=parsed.url,
+                    organization_id=parsed.organization_id,
+                    section_title=parsed.section_title,
+                    field_label=parsed.field_label,
+                    value_raw=parsed.value_raw,
+                    value=parsed.value,
+                    year=year,
+                    source=parsed.source,
+                )
+            existing = results_by_year.get(parsed.year) if parsed.year is not None else None
+            if parsed.year is not None and (existing is None or (existing.value_raw is None and parsed.value_raw is not None)):
+                results_by_year[parsed.year] = parsed
+
+        if results_by_year:
+            return [results_by_year[year] for year in sorted(results_by_year.keys(), reverse=True)]
+        return [first]
+    finally:
+        context.close()
+        browser.close()
+        playwright_ctx.stop()
+
+
 def _build_url(args: argparse.Namespace) -> str:
     if args.url:
         return args.url
@@ -337,6 +542,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable automatic Playwright fallback when plain HTTP parsing finds no value.",
     )
+    parser.add_argument(
+        "--all-years",
+        action="store_true",
+        help="Collect values across all year tabs (uses Playwright).",
+    )
     parser.add_argument("--json", action="store_true", help="Print output as JSON.")
     return parser.parse_args()
 
@@ -345,17 +555,41 @@ def main() -> int:
     args = _parse_args()
     try:
         url = _build_url(args)
-        result = scrape_revenue(
-            url=url,
-            section_title=args.section_title,
-            field_label=args.field_label,
-            timeout_seconds=args.timeout,
-            render=args.render,
-            fallback_render=not args.no_fallback_render,
-        )
+        if args.all_years:
+            all_results = scrape_revenue_all_years(
+                url=url,
+                section_title=args.section_title,
+                field_label=args.field_label,
+                timeout_seconds=args.timeout,
+            )
+        else:
+            result = scrape_revenue(
+                url=url,
+                section_title=args.section_title,
+                field_label=args.field_label,
+                timeout_seconds=args.timeout,
+                render=args.render,
+                fallback_render=not args.no_fallback_render,
+            )
     except BoNalogScraperError as exc:
         print(f"Error: {exc}")
         return 1
+
+    if args.all_years:
+        if args.json:
+            print(json.dumps([asdict(item) for item in all_results], ensure_ascii=False, indent=2))
+            return 0
+        if not all_results:
+            print("No values found.")
+            return 2
+        print(f"URL: {url}")
+        print(f"Найдено годов: {len(all_results)}")
+        for item in all_results:
+            year_text = str(item.year) if item.year is not None else "n/a"
+            raw = item.value_raw if item.value_raw is not None else "not found"
+            number = item.value if item.value is not None else "not found"
+            print(f"{year_text}: raw={raw}, float={number}")
+        return 0 if any(item.value_raw is not None for item in all_results) else 2
 
     if args.json:
         print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
