@@ -6,6 +6,7 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Optional
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote_plus, urljoin
 from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup, Tag
@@ -16,6 +17,7 @@ USER_AGENT = (
     "Chrome/136.0.0.0 Safari/537.36"
 )
 DEFAULT_TIMEOUT_SECONDS = 45
+SEARCH_URL_TEMPLATE = "https://bo.nalog.gov.ru/search?query={query}"
 DEFAULT_SECTION_TITLE = "Отчет о финансовых результатах - Упрощенная форма"
 DEFAULT_FIELD_LABEL = "Выручка, млн ₽"
 NUMERIC_RE = re.compile(r"[-−]?\d[\d\s\u00A0]*(?:[.,]\d+)?")
@@ -259,6 +261,118 @@ def _click_year_tab(page, year: int, timeout_ms: int) -> bool:
         return False
     page.wait_for_timeout(min(timeout_ms, 900))
     return True
+
+
+def open_single_search_result(search_url: str, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -> str:
+    def _dismiss_blocking_overlays() -> None:
+        close_selectors = (
+            "#modal button.close",
+            "#modal .close",
+            "#modal [aria-label='Close']",
+            "#modal [aria-label='Закрыть']",
+            ".modal button.close",
+            ".modal .close",
+            "[data-dismiss='modal']",
+        )
+        for selector in close_selectors:
+            locator = page.locator(selector)
+            try:
+                if locator.count() > 0:
+                    locator.first.click(timeout=1200, force=True)
+            except Exception:
+                continue
+        try:
+            page.evaluate(
+                """
+                () => {
+                  const selectors = [
+                    "#modal",
+                    ".modal-backdrop",
+                    ".modal",
+                    ".overlay",
+                    ".v-overlay",
+                    "[data-overlay]"
+                  ];
+                  for (const selector of selectors) {
+                    for (const el of document.querySelectorAll(selector)) {
+                      el.style.pointerEvents = "none";
+                      el.style.display = "none";
+                    }
+                  }
+                }
+                """
+            )
+        except Exception:
+            pass
+
+    timeout_ms = timeout_seconds * 1000
+    playwright_ctx, browser, context, page = _open_playwright_page(search_url, timeout_seconds)
+    try:
+        page.wait_for_timeout(700)
+        try:
+            page.locator("a.results-search-table-row[href]").first.wait_for(
+                state="attached", timeout=min(timeout_ms, 5000)
+            )
+        except Exception:
+            pass
+
+        links_locator = page.locator("a.results-search-table-row[href]")
+        links_count = links_locator.count()
+        if links_count == 0:
+            # Fallback for possible layout changes.
+            links_locator = page.locator("a[href*='organizations-card/']")
+            links_count = links_locator.count()
+
+        links: dict[str, int] = {}
+        for index in range(links_count):
+            href = links_locator.nth(index).get_attribute("href")
+            if not href or "organizations-card/" not in href:
+                continue
+            absolute = urljoin(search_url, href)
+            if absolute not in links:
+                links[absolute] = index
+
+        if not links:
+            raise BoNalogScraperError("No organizations-card links found on search page.")
+        if len(links) > 1:
+            preview = ", ".join(list(links.keys())[:5])
+            raise BoNalogScraperError(
+                f"Expected exactly one organizations-card link, found {len(links)}: {preview}"
+            )
+
+        target_url, target_index = next(iter(links.items()))
+        target = links_locator.nth(target_index)
+        clicked = False
+        try:
+            target.scroll_into_view_if_needed(timeout=min(timeout_ms, 5000))
+            target.click(timeout=min(timeout_ms, 7000))
+            clicked = True
+        except Exception:
+            _dismiss_blocking_overlays()
+            try:
+                target.click(timeout=min(timeout_ms, 4000), force=True)
+                # TODO: remove everything below
+                clicked = True
+            except Exception:
+                try:
+                    target.evaluate("el => el.click()")
+                    clicked = True
+                except Exception:
+                    clicked = False
+
+        try:
+            if clicked:
+                page.wait_for_url("**/organizations-card/*", timeout=min(timeout_ms, 10000))
+                return page.url
+        except Exception:
+            pass
+
+        page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        return page.url
+    finally:
+        context.close()
+        browser.close()
+        playwright_ctx.stop()
 
 
 def _has_section_ancestor(tag: Tag, section_title: str) -> bool:
@@ -512,11 +626,18 @@ def scrape_revenue_all_years(
 
 
 def _build_url(args: argparse.Namespace) -> str:
+    if args.search_query:
+        search_url = SEARCH_URL_TEMPLATE.format(query=quote_plus(args.search_query))
+        return open_single_search_result(search_url=search_url, timeout_seconds=args.timeout)
+    if args.search_url:
+        return open_single_search_result(search_url=args.search_url, timeout_seconds=args.timeout)
     if args.url:
         return args.url
     if args.org_id:
         return f"https://bo.nalog.gov.ru/organizations-card/{args.org_id}"
-    raise BoNalogScraperError("Specify either --url or --org-id.")
+    raise BoNalogScraperError(
+        "Specify one source: --url, --org-id, --search-query or --search-url."
+    )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -529,6 +650,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--url")
     parser.add_argument("--org-id")
+    parser.add_argument("--search-query", help="ИНН/ОГРН/название для поиска на bo.nalog.gov.ru.")
+    parser.add_argument(
+        "--search-url",
+        help="Полный URL страницы поиска, например https://bo.nalog.gov.ru/search?query=7703794060",
+    )
     parser.add_argument("--section-title", default=DEFAULT_SECTION_TITLE)
     parser.add_argument("--field-label", default=DEFAULT_FIELD_LABEL)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
