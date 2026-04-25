@@ -19,7 +19,7 @@ SECTION_EXECUTIVE = (
     "от имени юридического лица"
 )
 SECTION_FOUNDERS = "Сведения об участниках / учредителях юридического лица"
-BTN_NAME_PATTERN = re.compile("найти", re.IGNORECASE)
+BTN_NAME_RE = re.compile("найти", re.IGNORECASE)
 
 
 class EgrulScraperError(RuntimeError):
@@ -36,7 +36,7 @@ def _single_line(text: str) -> str:
 
 def _click_search_button(page, timeout_ms: int) -> None:
     button_candidates = [
-        page.get_by_role("button", name=BTN_NAME_PATTERN),
+        page.get_by_role("button", name=BTN_NAME_RE),
         page.locator("button#btnSearch"),
         page.locator("button.btn-search"),
         page.locator("button:has-text('Найти')"),
@@ -205,6 +205,35 @@ def _extract_lines_from_pdf(pdf_path: Path) -> list[str]:
     return lines
 
 
+def _extract_legal_address(all_lines: list[str]) -> str:
+    line_count = len(all_lines)
+    for index, line in enumerate(all_lines):
+        address_start = _match_labeled_value(line, "Адрес юридического лица")
+        if address_start is None:
+            continue
+
+        parts: list[str] = [address_start] if address_start else []
+        step = index + 1
+        while step < line_count:
+            probe_line = all_lines[step].strip()
+            if not probe_line:
+                step += 1
+                continue
+            probe_norm = _normalize_text(probe_line)
+            if _is_section_heading_text(probe_norm):
+                break
+            if re.match(r"^\d+\s", probe_line):
+                break
+            parts.append(probe_line)
+            step += 1
+
+        value = _single_line(" ".join(parts))
+        if value:
+            return value
+        return ""
+    return ""
+
+
 def parse_only_filtered_from_pdf(pdf_path: Path) -> dict[str, list[str]]:
     if not pdf_path.exists():
         raise EgrulScraperError(f"PDF file does not exist: {pdf_path}")
@@ -338,7 +367,9 @@ def main() -> int:
                 download_timeout_seconds=args.download_timeout,
                 headless=not args.headful,
             )
+        all_lines = _extract_lines_from_pdf(pdf_path)
         sections = parse_only_filtered_from_pdf(pdf_path)
+        legal_address = _extract_legal_address(all_lines)
     except EgrulScraperError as exc:
         print(f"Error: {exc}")
         return 1
@@ -347,6 +378,7 @@ def main() -> int:
         "inn": args.inn or "",
         "result_title": result_title,
         "pdf_path": str(pdf_path.resolve()),
+        "legal_address": legal_address,
         "sections": sections,
     }
     if args.json_out:
