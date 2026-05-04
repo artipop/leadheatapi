@@ -12,6 +12,8 @@ from urllib.error import URLError
 from urllib.request import urlopen
 from urllib.parse import urlsplit, urlunsplit
 
+from playwright.sync_api import Page
+
 DISCUSSION_RE = re.compile(r"(view\s*discussion|discussion|обсужд)", re.IGNORECASE)
 MEMBERS_COUNT_RE = re.compile(r"(members?|участник)", re.IGNORECASE)
 MEMBERS_TAB_RE = re.compile(r"^(members|участники)$", re.IGNORECASE)
@@ -112,7 +114,7 @@ def _extract_hash_key(url: str) -> str:
     return fragment.strip()
 
 
-def _is_active_chat_open(page: Any) -> bool:
+def _is_active_chat_open(page: Page) -> bool:
     try:
         return bool(
             page.evaluate(
@@ -131,15 +133,93 @@ def _is_active_chat_open(page: Any) -> bool:
                     const active = chats.find((chat) => chat.classList.contains('active') && isVisible(chat))
                         || chats.find((chat) => isVisible(chat));
                     if (!active) return false;
-                    const header = active.querySelector('.chat-info-container, .sidebar-header.topbar');
-                    if (!header) return false;
-                    const text = (header.textContent || '').trim();
-                    return text.length > 0;
+                    // Header text can be empty during transient Telegram sync state.
+                    const hasHeader = !!active.querySelector('.chat-info-container, .sidebar-header.topbar');
+                    const hasChatBody = !!active.querySelector('.bubbles, .bubbles-inner, .chat-input, .chat-background');
+                    return hasHeader || hasChatBody;
                 }"""
             )
         )
     except Exception:
         return False
+
+
+def _channel_runtime_state(page: Page) -> dict[Any, Any]:
+    try:
+        return dict(
+            page.evaluate(
+                """() => {
+                    const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const isVisible = (chat) => {
+                        const rect = chat.getBoundingClientRect();
+                        const style = window.getComputedStyle(chat);
+                        return (
+                            rect.width > 260 &&
+                            rect.height > 260 &&
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden'
+                        );
+                    };
+                    const chats = Array.from(document.querySelectorAll('.chat, .chat.tabs-tab'));
+                    const active = chats.find((chat) => chat.classList.contains('active') && isVisible(chat))
+                        || chats.find((chat) => isVisible(chat));
+                    const headerText = normalize(
+                        active?.querySelector('.chat-info-container, .sidebar-header.topbar')?.textContent || ''
+                    );
+                    const bodyText = normalize(document.body?.innerText || '');
+                    const waiting =
+                        bodyText.includes('waiting for network') ||
+                        bodyText.includes('updating...') ||
+                        bodyText.includes('обновление') ||
+                        bodyText.includes('ожидание сети');
+                    const bubblesCount = (active || document).querySelectorAll('.bubble, .channel-post').length;
+                    const repliesCount = (active || document).querySelectorAll('replies-element, .replies-footer, .replies-footer-text').length;
+                    return {
+                        has_active_chat: !!active,
+                        header_text: headerText,
+                        waiting_network: waiting,
+                        bubbles_count: bubblesCount,
+                        replies_count: repliesCount,
+                    };
+                }"""
+            )
+        )
+    except Exception:
+        return {
+            "has_active_chat": False,
+            "header_text": "",
+            "waiting_network": False,
+            "bubbles_count": 0,
+            "replies_count": 0,
+        }
+
+
+def _stabilize_channel_view(
+    page: Page,
+    source_url: str,
+    timeout_ms: int,
+    max_reloads: int = 2,
+) -> None:
+    reloads_left = max(0, max_reloads)
+    rounds = max(8, timeout_ms // 500)
+    for _ in range(rounds):
+        state = _channel_runtime_state(page)
+        has_content = bool(state.get("bubbles_count", 0) or state.get("replies_count", 0))
+        if state.get("has_active_chat") and not state.get("waiting_network") and has_content:
+            return
+        page.wait_for_timeout(500)
+
+        # Telegram Web can get stuck in "Waiting for network"; reload helps.
+        if state.get("waiting_network") and reloads_left > 0:
+            reloads_left -= 1
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+                page.wait_for_timeout(1_200)
+                if source_url:
+                    page.goto(source_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    page.wait_for_timeout(1_000)
+            except Exception:
+                pass
 
 
 def _looks_like_url(value: str) -> bool:
@@ -184,7 +264,7 @@ def read_channel_urls_from_csv(csv_path: Path, input_column: str | None) -> list
     return urls
 
 
-def _ensure_channel_open(page: Any, normalized_url: str, timeout_ms: int) -> bool:
+def _ensure_channel_open(page: Page, normalized_url: str, timeout_ms: int) -> bool:
     if _is_active_chat_open(page):
         return True
 
@@ -358,7 +438,7 @@ def _ensure_channel_open(page: Any, normalized_url: str, timeout_ms: int) -> boo
     return False
 
 
-def _is_group_chat_open(page: Any) -> bool:
+def _is_group_chat_open(page: Page) -> bool:
     try:
         return bool(
             page.evaluate(
@@ -395,7 +475,7 @@ def _is_group_chat_open(page: Any) -> bool:
         return False
 
 
-def _click_active_chat_menu(page: Any) -> bool:
+def _click_active_chat_menu(page: Page) -> bool:
     return bool(
         page.evaluate(
             """() => {
@@ -440,7 +520,7 @@ def _click_active_chat_menu(page: Any) -> bool:
     )
 
 
-def _click_discussion_item(page: Any) -> bool:
+def _click_discussion_item(page: Page) -> bool:
     return bool(
         page.evaluate(
             """() => {
@@ -465,7 +545,7 @@ def _click_discussion_item(page: Any) -> bool:
     )
 
 
-def _click_leave_comment(page: Any) -> bool:
+def _click_leave_comment(page: Page) -> bool:
     return bool(
         page.evaluate(
             """() => {
@@ -511,7 +591,7 @@ def _click_leave_comment(page: Any) -> bool:
     )
 
 
-def _click_discussion_anywhere(page: Any) -> bool:
+def _click_discussion_anywhere(page: Page) -> bool:
     return bool(
         page.evaluate(
             """() => {
@@ -599,7 +679,7 @@ def _click_discussion_anywhere(page: Any) -> bool:
     )
 
 
-def _click_discussion_via_playwright(page: Any) -> bool:
+def _click_discussion_via_playwright(page: Page) -> bool:
     patterns = [
         re.compile(r"view\s*discussion|discussion|обсужд", re.IGNORECASE),
         re.compile(r"leave\s+a\s+comment|open\s+comments|comments?|коммент", re.IGNORECASE),
@@ -620,7 +700,7 @@ def _click_discussion_via_playwright(page: Any) -> bool:
     return False
 
 
-def _discussion_debug_snapshot(page: Any) -> str:
+def _discussion_debug_snapshot(page: Page) -> str:
     try:
         payload = page.evaluate(
             """() => {
@@ -681,7 +761,7 @@ def _discussion_debug_snapshot(page: Any) -> str:
         return f"debug_collect_failed: {exc}"
 
 
-def _open_group_info(page: Any) -> bool:
+def _open_group_info(page: Page) -> bool:
     already_open = bool(
         page.evaluate(
             """() => {
@@ -742,7 +822,7 @@ def _open_group_info(page: Any) -> bool:
     return False
 
 
-def _maybe_subscribe(page: Any) -> bool:
+def _maybe_subscribe(page: Page) -> bool:
     return bool(
         page.evaluate(
             """() => {
@@ -763,7 +843,7 @@ def _maybe_subscribe(page: Any) -> bool:
     )
 
 
-def _ensure_members_tab(page: Any) -> None:
+def _ensure_members_tab(page: Page) -> None:
     page.evaluate(
         """() => {
             const sidebar = document.querySelector('.sidebar.sidebar-right') || document;
@@ -781,7 +861,7 @@ def _ensure_members_tab(page: Any) -> None:
     )
 
 
-def _extract_visible_members(page: Any) -> list[dict[str, str]]:
+def _extract_visible_members(page: Page) -> list[dict[str, str]]:
     data = page.evaluate(
         """() => {
             const rows = Array.from(
@@ -820,7 +900,7 @@ def _extract_visible_members(page: Any) -> list[dict[str, str]]:
     return members
 
 
-def _wait_for_members_list(page: Any, timeout_ms: int = 8_000) -> bool:
+def _wait_for_members_list(page: Page, timeout_ms: int = 8_000) -> bool:
     rounds = max(4, timeout_ms // 250)
     for _ in range(rounds):
         ready = bool(
@@ -841,7 +921,7 @@ def _wait_for_members_list(page: Any, timeout_ms: int = 8_000) -> bool:
     return False
 
 
-def _scroll_members_list(page: Any) -> bool:
+def _scroll_members_list(page: Page) -> bool:
     return bool(
         page.evaluate(
             """() => {
@@ -865,7 +945,7 @@ def _scroll_members_list(page: Any) -> bool:
 
 
 def _collect_members(
-    page: Any,
+    page: Page,
     max_scrolls: int,
     stable_rounds: int,
     scroll_pause_ms: int,
@@ -902,7 +982,7 @@ def _collect_members(
     return list(collected.values())
 
 
-def _try_open_discussion(page: Any, timeout_ms: int) -> tuple[bool, str]:
+def _try_open_discussion(page: Page, timeout_ms: int) -> tuple[bool, str]:
     clicked = False
     # Most reliable path in Telegram Web: click comments/discussion footer in a channel post.
     clicked = _click_leave_comment(page)
@@ -971,7 +1051,7 @@ def _discover_ws_debugger_url(cdp_endpoint: str, timeout_seconds: int = 5) -> st
 
 
 def process_channel(
-    page: Any,
+    page: Page,
     source_url: str,
     timeout_ms: int,
     max_scrolls: int,
@@ -1029,10 +1109,15 @@ def process_channel(
         ]
 
     resolved_channel_url = page.url
+    _stabilize_channel_view(page=page, source_url=normalized, timeout_ms=timeout_ms, max_reloads=2)
     if auto_subscribe and _maybe_subscribe(page):
         page.wait_for_timeout(800)
 
     opened, discussion_url = _try_open_discussion(page, timeout_ms=timeout_ms)
+    if not opened:
+        # One more pass after stabilization/reload for flaky Telegram sessions.
+        _stabilize_channel_view(page=page, source_url=normalized, timeout_ms=max(8_000, timeout_ms // 2), max_reloads=1)
+        opened, discussion_url = _try_open_discussion(page, timeout_ms=timeout_ms)
     if not opened:
         debug_info = _discussion_debug_snapshot(page)
         return [
@@ -1265,7 +1350,7 @@ def run() -> int:
                 else:
                     raise
             own_context = True
-            page = context.pages[0] if context.pages else context.new_page()
+            page: Page = context.pages[0] if context.pages else context.new_page()
             print(f"Persistent profile: {profile_dir}")
             print(f"Persistent browser: {'chromium(cft)' if not effective_channel else effective_channel}")
         else:
@@ -1303,7 +1388,7 @@ def run() -> int:
                 print("Connected to CDP, but no browser contexts are available.")
                 return 1
             context = browser.contexts[0]
-            page = context.pages[0] if context.pages else context.new_page()
+            page: Page = context.pages[0] if context.pages else context.new_page()
 
         try:
             page.goto("https://web.telegram.org/k/", wait_until="domcontentloaded", timeout=timeout_ms)
