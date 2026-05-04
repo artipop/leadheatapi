@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import argparse
 import csv
 import json
@@ -12,7 +13,7 @@ from urllib.error import URLError
 from urllib.request import urlopen
 from urllib.parse import urlsplit, urlunsplit
 
-from playwright.sync_api import Page
+from playwright.async_api import Page
 
 DISCUSSION_RE = re.compile(r"(view\s*discussion|discussion|обсужд)", re.IGNORECASE)
 MEMBERS_COUNT_RE = re.compile(r"(members?|участник)", re.IGNORECASE)
@@ -20,14 +21,14 @@ MEMBERS_TAB_RE = re.compile(r"^(members|участники)$", re.IGNORECASE)
 URL_COLUMN_CANDIDATES = ("telegram_url", "url", "channel_url", "telegram", "tg")
 
 
-def _require_sync_playwright():
+def _require_async_playwright():
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.async_api import async_playwright
     except ModuleNotFoundError as exc:
         raise SystemExit(
             "Playwright не установлен. Установите: uv add playwright && uv run playwright install chromium"
         ) from exc
-    return sync_playwright
+    return async_playwright
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -114,10 +115,10 @@ def _extract_hash_key(url: str) -> str:
     return fragment.strip()
 
 
-def _is_active_chat_open(page: Page) -> bool:
+async def _is_active_chat_open(page: Page) -> bool:
     try:
         return bool(
-            page.evaluate(
+            await page.evaluate(
                 """() => {
                     const isVisible = (chat) => {
                         const rect = chat.getBoundingClientRect();
@@ -144,10 +145,10 @@ def _is_active_chat_open(page: Page) -> bool:
         return False
 
 
-def _channel_runtime_state(page: Page) -> dict[Any, Any]:
+async def _channel_runtime_state(page: Page) -> dict[Any, Any]:
     try:
         return dict(
-            page.evaluate(
+            await page.evaluate(
                 """() => {
                     const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
                     const isVisible = (chat) => {
@@ -194,7 +195,7 @@ def _channel_runtime_state(page: Page) -> dict[Any, Any]:
         }
 
 
-def _stabilize_channel_view(
+async def _stabilize_channel_view(
     page: Page,
     source_url: str,
     timeout_ms: int,
@@ -203,21 +204,21 @@ def _stabilize_channel_view(
     reloads_left = max(0, max_reloads)
     rounds = max(8, timeout_ms // 500)
     for _ in range(rounds):
-        state = _channel_runtime_state(page)
+        state = await _channel_runtime_state(page)
         has_content = bool(state.get("bubbles_count", 0) or state.get("replies_count", 0))
         if state.get("has_active_chat") and not state.get("waiting_network") and has_content:
             return
-        page.wait_for_timeout(500)
+        await page.wait_for_timeout(500)
 
         # Telegram Web can get stuck in "Waiting for network"; reload helps.
         if state.get("waiting_network") and reloads_left > 0:
             reloads_left -= 1
             try:
-                page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
-                page.wait_for_timeout(1_200)
+                await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+                await page.wait_for_timeout(1_200)
                 if source_url:
-                    page.goto(source_url, wait_until="domcontentloaded", timeout=timeout_ms)
-                    page.wait_for_timeout(1_000)
+                    await page.goto(source_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    await page.wait_for_timeout(1_000)
             except Exception:
                 pass
 
@@ -264,8 +265,8 @@ def read_channel_urls_from_csv(csv_path: Path, input_column: str | None) -> list
     return urls
 
 
-def _ensure_channel_open(page: Page, normalized_url: str, timeout_ms: int) -> bool:
-    if _is_active_chat_open(page):
+async def _ensure_channel_open(page: Page, normalized_url: str, timeout_ms: int) -> bool:
+    if await _is_active_chat_open(page):
         return True
 
     target_key = _extract_hash_key(normalized_url).lower()
@@ -273,10 +274,10 @@ def _ensure_channel_open(page: Page, normalized_url: str, timeout_ms: int) -> bo
     target_username_norm = re.sub(r"[^a-z0-9а-яё]+", "", target_username.lower())
     rounds = max(12, timeout_ms // 250)
     for idx in range(rounds):
-        if _is_active_chat_open(page):
+        if await _is_active_chat_open(page):
             return True
 
-        best_href = page.evaluate(
+        best_href = await page.evaluate(
             """([targetKey, targetUserNorm]) => {
                 const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
                 const compact = (s) => normalize(s).replace(/[^a-z0-9а-яё]+/g, '');
@@ -315,20 +316,20 @@ def _ensure_channel_open(page: Page, normalized_url: str, timeout_ms: int) -> bo
         if best_href:
             if best_href.startswith("#-"):
                 try:
-                    page.goto(f"https://web.telegram.org/k/{best_href}", wait_until="domcontentloaded", timeout=3000)
-                    page.wait_for_timeout(350)
-                    if _is_active_chat_open(page):
+                    await page.goto(f"https://web.telegram.org/k/{best_href}", wait_until="domcontentloaded", timeout=3000)
+                    await page.wait_for_timeout(350)
+                    if await _is_active_chat_open(page):
                         return True
                 except Exception:
                     pass
             try:
-                page.locator(f'a[href="{best_href}"]').first.click(timeout=1200)
-                page.wait_for_timeout(300)
+                await page.locator(f'a[href="{best_href}"]').first.click(timeout=1200)
+                await page.wait_for_timeout(300)
             except Exception:
                 pass
 
         clicked = bool(
-            page.evaluate(
+            await page.evaluate(
                 """([targetKey, targetUserNorm]) => {
                     const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
                     const compact = (s) => normalize(s).replace(/[^a-z0-9а-яё]+/g, '');
@@ -373,13 +374,13 @@ def _ensure_channel_open(page: Page, normalized_url: str, timeout_ms: int) -> bo
         )
 
         if clicked:
-            page.wait_for_timeout(350)
-            if _is_active_chat_open(page):
+            await page.wait_for_timeout(350)
+            if await _is_active_chat_open(page):
                 return True
 
         # Periodic fallback via sidebar search (works when @username is unresolved).
         if target_username and idx % 4 == 0:
-            _ = page.evaluate(
+            _ = await page.evaluate(
                 """([rawUser, targetUserNorm]) => {
                     const inputs = Array.from(
                         document.querySelectorAll(
@@ -434,14 +435,14 @@ def _ensure_channel_open(page: Page, normalized_url: str, timeout_ms: int) -> bo
                 [target_username, target_username_norm],
             )
 
-        page.wait_for_timeout(250)
+        await page.wait_for_timeout(250)
     return False
 
 
-def _is_group_chat_open(page: Page) -> bool:
+async def _is_group_chat_open(page: Page) -> bool:
     try:
         return bool(
-            page.evaluate(
+            await page.evaluate(
                 """() => {
                     const isVisible = (chat) => {
                         const rect = chat.getBoundingClientRect();
@@ -475,9 +476,9 @@ def _is_group_chat_open(page: Page) -> bool:
         return False
 
 
-def _click_active_chat_menu(page: Page) -> bool:
+async def _click_active_chat_menu(page: Page) -> bool:
     return bool(
-        page.evaluate(
+        await page.evaluate(
             """() => {
                 const isVisible = (chat) => {
                     const rect = chat.getBoundingClientRect();
@@ -520,9 +521,9 @@ def _click_active_chat_menu(page: Page) -> bool:
     )
 
 
-def _click_discussion_item(page: Page) -> bool:
+async def _click_discussion_item(page: Page) -> bool:
     return bool(
-        page.evaluate(
+        await page.evaluate(
             """() => {
                 const pattern = /(view\\s*discussion|discussion|обсужд)/i;
                 const items = Array.from(document.querySelectorAll('.btn-menu-item')).filter((item) => {
@@ -545,9 +546,9 @@ def _click_discussion_item(page: Page) -> bool:
     )
 
 
-def _click_leave_comment(page: Page) -> bool:
+async def _click_leave_comment(page: Page) -> bool:
     return bool(
-        page.evaluate(
+        await page.evaluate(
             """() => {
                 const pattern = /(leave\\s+a\\s+comment|view\\s+comments|comments?|коммент|обсужд)/i;
                 const isVisible = (el) => {
@@ -591,9 +592,9 @@ def _click_leave_comment(page: Page) -> bool:
     )
 
 
-def _click_discussion_anywhere(page: Page) -> bool:
+async def _click_discussion_anywhere(page: Page) -> bool:
     return bool(
-        page.evaluate(
+        await page.evaluate(
             """() => {
                 const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
                 const patternStrong = /(view\\s*discussion|open\\s*comments|leave\\s+a\\s+comment|обсужд|коммент)/i;
@@ -604,8 +605,7 @@ def _click_discussion_anywhere(page: Page) -> bool:
                     const rect = el.getBoundingClientRect();
                     if (rect.width <= 0 || rect.height <= 0) return false;
                     const style = window.getComputedStyle(el);
-                    if (style.visibility === 'hidden' || style.display === 'none') return false;
-                    return true;
+                    return !(style.visibility === 'hidden' || style.display === 'none');
                 };
 
                 const isClickable = (el) => {
@@ -665,7 +665,7 @@ def _click_discussion_anywhere(page: Page) -> bool:
                         if (clickable.matches('.btn-menu-item')) score += 20;
                         if (clickable.matches('button, a')) score += 10;
                         score -= Math.max(0, text.length - 40) / 10;
-                        candidates.push({ clickable, score });
+                        candidates.push({clickable, score});
                     }
                 }
 
@@ -679,7 +679,7 @@ def _click_discussion_anywhere(page: Page) -> bool:
     )
 
 
-def _click_discussion_via_playwright(page: Page) -> bool:
+async def _click_discussion_via_playwright(page: Page) -> bool:
     patterns = [
         re.compile(r"view\s*discussion|discussion|обсужд", re.IGNORECASE),
         re.compile(r"leave\s+a\s+comment|open\s+comments|comments?|коммент", re.IGNORECASE),
@@ -687,22 +687,22 @@ def _click_discussion_via_playwright(page: Page) -> bool:
     for pattern in patterns:
         try:
             locator = page.get_by_text(pattern)
-            count = min(locator.count(), 10)
+            count = min(await locator.count(), 10)
         except Exception:
             continue
         for index in range(count):
             try:
-                locator.nth(index).click(timeout=1200, force=True)
-                page.wait_for_timeout(450)
+                await locator.nth(index).click(timeout=1200, force=True)
+                await page.wait_for_timeout(450)
                 return True
             except Exception:
                 continue
     return False
 
 
-def _discussion_debug_snapshot(page: Page) -> str:
+async def _discussion_debug_snapshot(page: Page) -> str:
     try:
-        payload = page.evaluate(
+        payload = await page.evaluate(
             """() => {
                 const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim();
                 const isVisible = (chat) => {
@@ -761,9 +761,9 @@ def _discussion_debug_snapshot(page: Page) -> str:
         return f"debug_collect_failed: {exc}"
 
 
-def _open_group_info(page: Page) -> bool:
+async def _open_group_info(page: Page) -> bool:
     already_open = bool(
-        page.evaluate(
+        await page.evaluate(
             """() => {
                 const sidebar = document.querySelector('.sidebar.sidebar-right');
                 if (!sidebar) return false;
@@ -778,7 +778,7 @@ def _open_group_info(page: Page) -> bool:
         return True
 
     clicked = bool(
-        page.evaluate(
+        await page.evaluate(
             """() => {
                 const isVisible = (chat) => {
                     const rect = chat.getBoundingClientRect();
@@ -805,7 +805,7 @@ def _open_group_info(page: Page) -> bool:
 
     for _ in range(20):
         ready = bool(
-            page.evaluate(
+            await page.evaluate(
                 """() => {
                     const sidebar = document.querySelector('.sidebar.sidebar-right');
                     if (!sidebar) return false;
@@ -818,13 +818,13 @@ def _open_group_info(page: Page) -> bool:
         )
         if ready:
             return True
-        page.wait_for_timeout(250)
+        await page.wait_for_timeout(250)
     return False
 
 
-def _maybe_subscribe(page: Page) -> bool:
+async def _maybe_subscribe(page: Page) -> bool:
     return bool(
-        page.evaluate(
+        await page.evaluate(
             """() => {
                 const pattern = /(subscribe|join|подпис|вступить)/i;
                 const buttons = Array.from(document.querySelectorAll('button, a'));
@@ -843,8 +843,8 @@ def _maybe_subscribe(page: Page) -> bool:
     )
 
 
-def _ensure_members_tab(page: Page) -> None:
-    page.evaluate(
+async def _ensure_members_tab(page: Page) -> None:
+    await page.evaluate(
         """() => {
             const sidebar = document.querySelector('.sidebar.sidebar-right') || document;
             const targets = Array.from(sidebar.querySelectorAll('nav *, [role="tab"], .tabs-with-icons *'));
@@ -861,8 +861,8 @@ def _ensure_members_tab(page: Page) -> None:
     )
 
 
-def _extract_visible_members(page: Page) -> list[dict[str, str]]:
-    data = page.evaluate(
+async def _extract_visible_members(page: Page) -> list[dict[str, str]]:
+    data = await page.evaluate(
         """() => {
             const rows = Array.from(
                 document.querySelectorAll(
@@ -900,11 +900,11 @@ def _extract_visible_members(page: Page) -> list[dict[str, str]]:
     return members
 
 
-def _wait_for_members_list(page: Page, timeout_ms: int = 8_000) -> bool:
+async def _wait_for_members_list(page: Page, timeout_ms: int = 8_000) -> bool:
     rounds = max(4, timeout_ms // 250)
     for _ in range(rounds):
         ready = bool(
-            page.evaluate(
+            await page.evaluate(
                 """() => {
                     const sidebar = document.querySelector('.sidebar.sidebar-right');
                     if (!sidebar) return false;
@@ -916,14 +916,14 @@ def _wait_for_members_list(page: Page, timeout_ms: int = 8_000) -> bool:
         )
         if ready:
             return True
-        _ensure_members_tab(page)
-        page.wait_for_timeout(250)
+        await _ensure_members_tab(page)
+        await page.wait_for_timeout(250)
     return False
 
 
-def _scroll_members_list(page: Page) -> bool:
+async def _scroll_members_list(page: Page) -> bool:
     return bool(
-        page.evaluate(
+        await page.evaluate(
             """() => {
                 const row = document.querySelector(
                     '.sidebar.sidebar-right a.chatlist-chat-abitbigger[data-peer-id], .sidebar.sidebar-right .chatlist-chat-abitbigger[data-peer-id], .sidebar.sidebar-right .chatlist-chat[data-peer-id]'
@@ -944,7 +944,7 @@ def _scroll_members_list(page: Page) -> bool:
     )
 
 
-def _collect_members(
+async def _collect_members(
     page: Page,
     max_scrolls: int,
     stable_rounds: int,
@@ -954,9 +954,9 @@ def _collect_members(
     stable = 0
 
     for _ in range(max_scrolls):
-        visible = _extract_visible_members(page)
+        visible = await _extract_visible_members(page)
         if not visible and not collected:
-            page.wait_for_timeout(max(200, scroll_pause_ms))
+            await page.wait_for_timeout(max(200, scroll_pause_ms))
             continue
         before = len(collected)
         for item in visible:
@@ -974,38 +974,38 @@ def _collect_members(
         if stable >= stable_rounds:
             break
 
-        moved = _scroll_members_list(page)
+        moved = await _scroll_members_list(page)
         if not moved:
             break
-        page.wait_for_timeout(scroll_pause_ms)
+        await page.wait_for_timeout(scroll_pause_ms)
 
     return list(collected.values())
 
 
-def _try_open_discussion(page: Page, timeout_ms: int) -> tuple[bool, str]:
+async def _try_open_discussion(page: Page, timeout_ms: int) -> tuple[bool, str]:
     clicked = False
     # Most reliable path in Telegram Web: click comments/discussion footer in a channel post.
-    clicked = _click_leave_comment(page)
+    clicked = await _click_leave_comment(page)
     if not clicked:
-        menu_opened = _click_active_chat_menu(page)
+        menu_opened = await _click_active_chat_menu(page)
         if menu_opened:
-            clicked = _click_discussion_item(page)
+            clicked = await _click_discussion_item(page)
             if not clicked:
-                page.keyboard.press("Escape")
+                await page.keyboard.press("Escape")
     if not clicked:
         # Last-resort heuristic: click any visible discussion/comment action.
-        clicked = _click_discussion_anywhere(page)
+        clicked = await _click_discussion_anywhere(page)
     if not clicked:
         # Playwright locator fallback works better on some Telegram builds.
-        clicked = _click_discussion_via_playwright(page)
+        clicked = await _click_discussion_via_playwright(page)
     if not clicked:
         return False, ""
 
     initial_url = page.url
     rounds = max(8, timeout_ms // 250)
     for _ in range(rounds):
-        page.wait_for_timeout(250)
-        if _is_group_chat_open(page):
+        await page.wait_for_timeout(250)
+        if await _is_group_chat_open(page):
             return True, page.url
         if page.url != initial_url:
             # Telegram often switches hash first and only then syncs header/sidebar.
@@ -1050,7 +1050,7 @@ def _discover_ws_debugger_url(cdp_endpoint: str, timeout_seconds: int = 5) -> st
     return None
 
 
-def process_channel(
+async def process_channel(
     page: Page,
     source_url: str,
     timeout_ms: int,
@@ -1076,8 +1076,8 @@ def process_channel(
         ]
 
     try:
-        page.goto(normalized, wait_until="domcontentloaded", timeout=timeout_ms)
-        page.wait_for_timeout(1_200)
+        await page.goto(normalized, wait_until="domcontentloaded", timeout=timeout_ms)
+        await page.wait_for_timeout(1_200)
     except Exception as exc:
         return [
             {
@@ -1093,7 +1093,7 @@ def process_channel(
             }
         ]
 
-    if not _ensure_channel_open(page, normalized_url=normalized, timeout_ms=timeout_ms):
+    if not await _ensure_channel_open(page, normalized_url=normalized, timeout_ms=timeout_ms):
         return [
             {
                 "source_channel_url": source_url,
@@ -1104,22 +1104,22 @@ def process_channel(
                 "peer_id": "",
                 "member_status": "",
                 "status": "channel_not_opened",
-                "error": _discussion_debug_snapshot(page),
+                "error": await _discussion_debug_snapshot(page),
             }
         ]
 
     resolved_channel_url = page.url
-    _stabilize_channel_view(page=page, source_url=normalized, timeout_ms=timeout_ms, max_reloads=2)
-    if auto_subscribe and _maybe_subscribe(page):
-        page.wait_for_timeout(800)
+    await _stabilize_channel_view(page=page, source_url=normalized, timeout_ms=timeout_ms, max_reloads=2)
+    if auto_subscribe and await _maybe_subscribe(page):
+        await page.wait_for_timeout(800)
 
-    opened, discussion_url = _try_open_discussion(page, timeout_ms=timeout_ms)
+    opened, discussion_url = await _try_open_discussion(page, timeout_ms=timeout_ms)
     if not opened:
         # One more pass after stabilization/reload for flaky Telegram sessions.
-        _stabilize_channel_view(page=page, source_url=normalized, timeout_ms=max(8_000, timeout_ms // 2), max_reloads=1)
-        opened, discussion_url = _try_open_discussion(page, timeout_ms=timeout_ms)
+        await _stabilize_channel_view(page=page, source_url=normalized, timeout_ms=max(8_000, timeout_ms // 2), max_reloads=1)
+        opened, discussion_url = await _try_open_discussion(page, timeout_ms=timeout_ms)
     if not opened:
-        debug_info = _discussion_debug_snapshot(page)
+        debug_info = await _discussion_debug_snapshot(page)
         return [
             {
                 "source_channel_url": source_url,
@@ -1134,7 +1134,7 @@ def process_channel(
             }
         ]
 
-    if not _open_group_info(page):
+    if not await _open_group_info(page):
         return [
             {
                 "source_channel_url": source_url,
@@ -1149,10 +1149,10 @@ def process_channel(
             }
         ]
 
-    _ensure_members_tab(page)
-    _wait_for_members_list(page, timeout_ms=max(4_000, timeout_ms // 2))
+    await _ensure_members_tab(page)
+    await _wait_for_members_list(page, timeout_ms=max(4_000, timeout_ms // 2))
 
-    members = _collect_members(
+    members = await _collect_members(
         page=page,
         max_scrolls=max_scrolls,
         stable_rounds=stable_rounds,
@@ -1291,7 +1291,7 @@ def write_output(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
-def run() -> int:
+async def run() -> int:
     args = parse_args()
     input_path = Path(args.input_csv).expanduser().resolve()
     output_path = Path(args.output_csv).expanduser().resolve()
@@ -1305,10 +1305,10 @@ def run() -> int:
         return 1
 
     timeout_ms = max(5, args.timeout_seconds) * 1000
-    sync_playwright = _require_sync_playwright()
+    async_playwright_runner = _require_async_playwright()
     all_rows: list[dict[str, str]] = []
 
-    with sync_playwright() as playwright:
+    async with async_playwright_runner() as playwright:
         context = None
         own_context = False
         if args.mode == "persistent":
@@ -1326,7 +1326,7 @@ def run() -> int:
             if channel:
                 launch_kwargs["channel"] = channel
             try:
-                context = playwright.chromium.launch_persistent_context(
+                context = await playwright.chromium.launch_persistent_context(
                     **launch_kwargs,
                 )
             except Exception as exc:
@@ -1337,7 +1337,7 @@ def run() -> int:
                     try:
                         print(f"Primary profile failed for CFT: {profile_dir}")
                         print("Retrying with system Chrome channel...")
-                        context = playwright.chromium.launch_persistent_context(**system_kwargs)
+                        context = await playwright.chromium.launch_persistent_context(**system_kwargs)
                         effective_channel = "chrome"
                     except Exception:
                         fallback_dir = profile_dir.with_name(f"{profile_dir.name}-cft")
@@ -1345,22 +1345,22 @@ def run() -> int:
                         _cleanup_stale_profile_locks(fallback_dir)
                         launch_kwargs["user_data_dir"] = str(fallback_dir)
                         print(f"Retrying with fallback profile: {fallback_dir}")
-                        context = playwright.chromium.launch_persistent_context(**launch_kwargs)
+                        context = await playwright.chromium.launch_persistent_context(**launch_kwargs)
                         profile_dir = fallback_dir
                 else:
                     raise
             own_context = True
-            page: Page = context.pages[0] if context.pages else context.new_page()
+            page: Page = context.pages[0] if context.pages else await context.new_page()
             print(f"Persistent profile: {profile_dir}")
             print(f"Persistent browser: {'chromium(cft)' if not effective_channel else effective_channel}")
         else:
             browser = None
             primary_error: Exception | None = None
             try:
-                browser = playwright.chromium.connect_over_cdp(args.cdp_endpoint, timeout=timeout_ms)
+                browser = await playwright.chromium.connect_over_cdp(args.cdp_endpoint, timeout=timeout_ms)
             except TypeError:
                 try:
-                    browser = playwright.chromium.connect_over_cdp(args.cdp_endpoint)
+                    browser = await playwright.chromium.connect_over_cdp(args.cdp_endpoint)
                 except Exception as exc:
                     primary_error = exc
             except Exception as exc:
@@ -1370,7 +1370,7 @@ def run() -> int:
                 ws_url = _discover_ws_debugger_url(args.cdp_endpoint)
                 if ws_url:
                     try:
-                        browser = playwright.chromium.connect_over_cdp(ws_url, timeout=timeout_ms)
+                        browser = await playwright.chromium.connect_over_cdp(ws_url, timeout=timeout_ms)
                         print(f"CDP fallback: connected via {ws_url}")
                     except Exception:
                         browser = None
@@ -1388,17 +1388,17 @@ def run() -> int:
                 print("Connected to CDP, but no browser contexts are available.")
                 return 1
             context = browser.contexts[0]
-            page: Page = context.pages[0] if context.pages else context.new_page()
+            page: Page = context.pages[0] if context.pages else await context.new_page()
 
         try:
-            page.goto("https://web.telegram.org/k/", wait_until="domcontentloaded", timeout=timeout_ms)
-            page.wait_for_timeout(1_000)
+            await page.goto("https://web.telegram.org/k/", wait_until="domcontentloaded", timeout=timeout_ms)
+            await page.wait_for_timeout(1_000)
         except Exception:
             pass
 
         if args.mode == "persistent":
             is_logged_in = bool(
-                page.evaluate(
+                await page.evaluate(
                     """() => {
                         const loginMarkers = [
                             ...document.querySelectorAll('input, button, div, span')
@@ -1423,10 +1423,10 @@ def run() -> int:
                 deadline_ms = wait_seconds * 1000
                 elapsed = 0
                 while elapsed < deadline_ms:
-                    page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(2000)
                     elapsed += 2000
                     is_logged_in = bool(
-                        page.evaluate(
+                        await page.evaluate(
                             """() => {
                                 const loginMarkers = [
                                     ...document.querySelectorAll('input, button, div, span')
@@ -1450,7 +1450,7 @@ def run() -> int:
                 if not is_logged_in:
                     print("Логин в Telegram не завершён. Завершите вход и запустите скрипт снова.")
                     if own_context and context is not None:
-                        context.close()
+                        await context.close()
                     return 1
 
             if not bool(args.no_login_prompt):
@@ -1464,7 +1464,7 @@ def run() -> int:
         for index, source_url in enumerate(source_urls, start=1):
             print(f"[{index}/{len(source_urls)}] {source_url}")
             try:
-                rows = process_channel(
+                rows = await process_channel(
                     page=page,
                     source_url=source_url,
                     timeout_ms=timeout_ms,
@@ -1490,7 +1490,7 @@ def run() -> int:
             all_rows.extend(rows)
 
         if own_context and context is not None:
-            context.close()
+            await context.close()
 
     write_output(output_path, all_rows)
     ok_count = sum(1 for row in all_rows if row.get("status") == "ok")
@@ -1500,4 +1500,4 @@ def run() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(run())
+    sys.exit(asyncio.run(run()))
