@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import argparse
+import asyncio
 import csv
 import json
 import os
@@ -10,14 +10,33 @@ import sys
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
-from urllib.request import urlopen
 from urllib.parse import urlsplit, urlunsplit
+from urllib.request import urlopen
 
 from playwright.async_api import Page
 
-DISCUSSION_RE = re.compile(r"(view\s*discussion|discussion|обсужд)", re.IGNORECASE)
-MEMBERS_COUNT_RE = re.compile(r"(members?|участник)", re.IGNORECASE)
-MEMBERS_TAB_RE = re.compile(r"^(members|участники)$", re.IGNORECASE)
+from app.datamining.contacts.telegram_js import (
+    JS_CHANNEL_RUNTIME_STATE,
+    JS_CLICK_ACTIVE_CHAT_MENU,
+    JS_CLICK_BEST_CHAT_LINK,
+    JS_CLICK_DISCUSSION_ANYWHERE,
+    JS_CLICK_DISCUSSION_MENU_ITEM,
+    JS_CLICK_LEAVE_COMMENT_OR_COMMENTS,
+    JS_CLICK_SUBSCRIBE_OR_JOIN,
+    JS_DISCUSSION_DEBUG_SNAPSHOT,
+    JS_EXTRACT_VISIBLE_MEMBERS,
+    JS_FIND_BEST_CHAT_HREF,
+    JS_HAS_MEMBERS_LIST_ROWS,
+    JS_IS_ACTIVE_CHAT_OPEN,
+    JS_IS_GROUP_CHAT_OPEN,
+    JS_IS_GROUP_INFO_OPEN,
+    JS_IS_LOGGED_IN_TELEGRAM_WEB,
+    JS_OPEN_GROUP_INFO_BY_HEADER_CLICK,
+    JS_SCROLL_MEMBERS_LIST,
+    JS_SEARCH_AND_CLICK_CHAT_BY_USERNAME,
+    JS_SELECT_MEMBERS_TAB,
+)
+
 URL_COLUMN_CANDIDATES = ("telegram_url", "url", "channel_url", "telegram", "tg")
 
 
@@ -117,74 +136,14 @@ def _extract_hash_key(url: str) -> str:
 
 async def _is_active_chat_open(page: Page) -> bool:
     try:
-        return bool(
-            await page.evaluate(
-                """() => {
-                    const isVisible = (chat) => {
-                        const rect = chat.getBoundingClientRect();
-                        const style = window.getComputedStyle(chat);
-                        return (
-                            rect.width > 260 &&
-                            rect.height > 260 &&
-                            style.display !== 'none' &&
-                            style.visibility !== 'hidden'
-                        );
-                    };
-                    const chats = Array.from(document.querySelectorAll('.chat, .chat.tabs-tab'));
-                    const active = chats.find((chat) => chat.classList.contains('active') && isVisible(chat))
-                        || chats.find((chat) => isVisible(chat));
-                    if (!active) return false;
-                    // Header text can be empty during transient Telegram sync state.
-                    const hasHeader = !!active.querySelector('.chat-info-container, .sidebar-header.topbar');
-                    const hasChatBody = !!active.querySelector('.bubbles, .bubbles-inner, .chat-input, .chat-background');
-                    return hasHeader || hasChatBody;
-                }"""
-            )
-        )
+        return bool(await page.evaluate(JS_IS_ACTIVE_CHAT_OPEN))
     except Exception:
         return False
 
 
 async def _channel_runtime_state(page: Page) -> dict[Any, Any]:
     try:
-        return dict(
-            await page.evaluate(
-                """() => {
-                    const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                    const isVisible = (chat) => {
-                        const rect = chat.getBoundingClientRect();
-                        const style = window.getComputedStyle(chat);
-                        return (
-                            rect.width > 260 &&
-                            rect.height > 260 &&
-                            style.display !== 'none' &&
-                            style.visibility !== 'hidden'
-                        );
-                    };
-                    const chats = Array.from(document.querySelectorAll('.chat, .chat.tabs-tab'));
-                    const active = chats.find((chat) => chat.classList.contains('active') && isVisible(chat))
-                        || chats.find((chat) => isVisible(chat));
-                    const headerText = normalize(
-                        active?.querySelector('.chat-info-container, .sidebar-header.topbar')?.textContent || ''
-                    );
-                    const bodyText = normalize(document.body?.innerText || '');
-                    const waiting =
-                        bodyText.includes('waiting for network') ||
-                        bodyText.includes('updating...') ||
-                        bodyText.includes('обновление') ||
-                        bodyText.includes('ожидание сети');
-                    const bubblesCount = (active || document).querySelectorAll('.bubble, .channel-post').length;
-                    const repliesCount = (active || document).querySelectorAll('replies-element, .replies-footer, .replies-footer-text').length;
-                    return {
-                        has_active_chat: !!active,
-                        header_text: headerText,
-                        waiting_network: waiting,
-                        bubbles_count: bubblesCount,
-                        replies_count: repliesCount,
-                    };
-                }"""
-            )
-        )
+        return dict(await page.evaluate(JS_CHANNEL_RUNTIME_STATE))
     except Exception:
         return {
             "has_active_chat": False,
@@ -196,10 +155,10 @@ async def _channel_runtime_state(page: Page) -> dict[Any, Any]:
 
 
 async def _stabilize_channel_view(
-    page: Page,
-    source_url: str,
-    timeout_ms: int,
-    max_reloads: int = 2,
+        page: Page,
+        source_url: str,
+        timeout_ms: int,
+        max_reloads: int = 2,
 ) -> None:
     reloads_left = max(0, max_reloads)
     rounds = max(8, timeout_ms // 500)
@@ -277,46 +236,12 @@ async def _ensure_channel_open(page: Page, normalized_url: str, timeout_ms: int)
         if await _is_active_chat_open(page):
             return True
 
-        best_href = await page.evaluate(
-            """([targetKey, targetUserNorm]) => {
-                const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                const compact = (s) => normalize(s).replace(/[^a-z0-9а-яё]+/g, '');
-                const links = Array.from(document.querySelectorAll('a[href]'));
-                let best = null;
-                let bestScore = -1;
-                for (const link of links) {
-                    const href = normalize(link.getAttribute('href') || '');
-                    const text = normalize(link.textContent || '');
-                    const textCompact = compact(text);
-                    if (!href && !text) continue;
-                    let score = 0;
-                    if (targetKey && href.includes(targetKey)) score += 100;
-                    if (targetUserNorm && textCompact.includes(targetUserNorm)) score += 40;
-                    if (link.className && String(link.className).includes('chatlist-chat')) score += 20;
-                    const rect = link.getBoundingClientRect();
-                    const style = window.getComputedStyle(link);
-                    const visible =
-                        rect.width > 0 &&
-                        rect.height > 0 &&
-                        style.visibility !== 'hidden' &&
-                        style.display !== 'none';
-                    if (!visible) score -= 100;
-                    if (score > bestScore) {
-                        best = link;
-                        bestScore = score;
-                    }
-                }
-                if (best && bestScore > 20) {
-                    return best.getAttribute('href') || '';
-                }
-                return '';
-            }""",
-            [target_key, target_username_norm],
-        )
+        best_href = await page.evaluate(JS_FIND_BEST_CHAT_HREF, [target_key, target_username_norm])
         if best_href:
             if best_href.startswith("#-"):
                 try:
-                    await page.goto(f"https://web.telegram.org/k/{best_href}", wait_until="domcontentloaded", timeout=3000)
+                    await page.goto(f"https://web.telegram.org/k/{best_href}", wait_until="domcontentloaded",
+                                    timeout=3000)
                     await page.wait_for_timeout(350)
                     if await _is_active_chat_open(page):
                         return True
@@ -328,50 +253,7 @@ async def _ensure_channel_open(page: Page, normalized_url: str, timeout_ms: int)
             except Exception:
                 pass
 
-        clicked = bool(
-            await page.evaluate(
-                """([targetKey, targetUserNorm]) => {
-                    const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                    const compact = (s) => normalize(s).replace(/[^a-z0-9а-яё]+/g, '');
-                    const links = Array.from(document.querySelectorAll('a[href]'));
-                    let best = null;
-                    let bestScore = -1;
-
-                    for (const link of links) {
-                        const href = normalize(link.getAttribute('href') || '');
-                        const text = normalize(link.textContent || '');
-                        const textCompact = compact(text);
-                        if (!href && !text) continue;
-
-                        let score = 0;
-                        if (targetKey && href.includes(targetKey)) score += 100;
-                        if (targetUserNorm && textCompact.includes(targetUserNorm)) score += 40;
-                        if (link.className && String(link.className).includes('chatlist-chat')) score += 20;
-
-                        const rect = link.getBoundingClientRect();
-                        const style = window.getComputedStyle(link);
-                        const visible =
-                            rect.width > 0 &&
-                            rect.height > 0 &&
-                            style.visibility !== 'hidden' &&
-                            style.display !== 'none';
-                        if (!visible) score -= 100;
-
-                        if (score > bestScore) {
-                            best = link;
-                            bestScore = score;
-                        }
-                    }
-
-                    if (best && bestScore > 20) {
-                        best.click();
-                        return true;
-                    }
-                    return false;
-                }""",
-                [target_key, target_username_norm],
-            )
-        )
+        clicked = bool(await page.evaluate(JS_CLICK_BEST_CHAT_LINK, [target_key, target_username_norm]))
 
         if clicked:
             await page.wait_for_timeout(350)
@@ -380,60 +262,7 @@ async def _ensure_channel_open(page: Page, normalized_url: str, timeout_ms: int)
 
         # Periodic fallback via sidebar search (works when @username is unresolved).
         if target_username and idx % 4 == 0:
-            _ = await page.evaluate(
-                """([rawUser, targetUserNorm]) => {
-                    const inputs = Array.from(
-                        document.querySelectorAll(
-                            'input[type="text"], input, [contenteditable="true"][role="textbox"], [contenteditable="true"]'
-                        )
-                    );
-                    const input = inputs.find((el) => {
-                        const rect = el.getBoundingClientRect();
-                        const style = window.getComputedStyle(el);
-                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-                    });
-                    if (!input) return false;
-
-                    input.focus();
-                    if ('value' in input) {
-                        input.value = rawUser;
-                    } else {
-                        input.textContent = rawUser;
-                    }
-                    input.dispatchEvent(new Event('input', { bubbles: true }));
-
-                    const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                    const compact = (s) => normalize(s).replace(/[^a-z0-9а-яё]+/g, '');
-                    const links = Array.from(document.querySelectorAll('a[href], .chatlist-chat'));
-                    let best = null;
-                    let bestScore = -1;
-                    for (const link of links) {
-                        const text = normalize(link.textContent || '');
-                        const textCompact = compact(text);
-                        if (!text) continue;
-                        let score = 0;
-                        if (targetUserNorm && textCompact.includes(targetUserNorm)) score += 80;
-                        const rect = link.getBoundingClientRect();
-                        const style = window.getComputedStyle(link);
-                        const visible =
-                            rect.width > 0 &&
-                            rect.height > 0 &&
-                            style.visibility !== 'hidden' &&
-                            style.display !== 'none';
-                        if (!visible) score -= 100;
-                        if (score > bestScore) {
-                            best = link;
-                            bestScore = score;
-                        }
-                    }
-                    if (best && bestScore > 20) {
-                        best.click();
-                        return true;
-                    }
-                    return false;
-                }""",
-                [target_username, target_username_norm],
-            )
+            _ = await page.evaluate(JS_SEARCH_AND_CLICK_CHAT_BY_USERNAME, [target_username, target_username_norm])
 
         await page.wait_for_timeout(250)
     return False
@@ -441,242 +270,25 @@ async def _ensure_channel_open(page: Page, normalized_url: str, timeout_ms: int)
 
 async def _is_group_chat_open(page: Page) -> bool:
     try:
-        return bool(
-            await page.evaluate(
-                """() => {
-                    const isVisible = (chat) => {
-                        const rect = chat.getBoundingClientRect();
-                        const style = window.getComputedStyle(chat);
-                        return (
-                            rect.width > 260 &&
-                            rect.height > 260 &&
-                            style.display !== 'none' &&
-                            style.visibility !== 'hidden'
-                        );
-                    };
-                    const chats = Array.from(document.querySelectorAll('.chat, .chat.tabs-tab'));
-                    const active = chats.find((chat) => chat.classList.contains('active') && isVisible(chat))
-                        || chats.find((chat) => isVisible(chat));
-                    if (!active) return false;
-                    const header = active.querySelector('.chat-info-container, .sidebar-header.topbar');
-                    const headerText = (header?.textContent || '').toLowerCase();
-                    if (/subscribers?|подписчик/.test(headerText)) return false;
-                    if (/comments?|discussion|обсужд|коммент/.test(headerText)) return true;
-                    if (/members?|участник/.test(headerText)) return true;
-                    const sidebar = document.querySelector('.sidebar.sidebar-right');
-                    const sidebarText = (sidebar?.textContent || '').toLowerCase();
-                    if (/channel info|информация о канале/.test(sidebarText)) return false;
-                    if (/group info|информация о группе/.test(sidebarText)) return true;
-                    const hasMemberRows = !!sidebar?.querySelector('[data-peer-id]');
-                    return /members|участник/.test(sidebarText) && hasMemberRows;
-                }"""
-            )
-        )
+        return bool(await page.evaluate(JS_IS_GROUP_CHAT_OPEN))
     except Exception:
         return False
 
 
 async def _click_active_chat_menu(page: Page) -> bool:
-    return bool(
-        await page.evaluate(
-            """() => {
-                const isVisible = (chat) => {
-                    const rect = chat.getBoundingClientRect();
-                    const style = window.getComputedStyle(chat);
-                    return (
-                        rect.width > 260 &&
-                        rect.height > 260 &&
-                        style.display !== 'none' &&
-                        style.visibility !== 'hidden'
-                    );
-                };
-                const chats = Array.from(document.querySelectorAll('.chat, .chat.tabs-tab'));
-                const active = chats.find((chat) => chat.classList.contains('active') && isVisible(chat))
-                    || chats.find((chat) => isVisible(chat));
-                if (!active) return false;
-
-                // Close any previous overlays/popups that may steal focus.
-                document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
-
-                const buttons = Array.from(active.querySelectorAll('.chat-info-container button.btn-menu-toggle')).filter((button) => {
-                    const rect = button.getBoundingClientRect();
-                    const style = window.getComputedStyle(button);
-                    return (
-                        rect.width > 0 &&
-                        rect.height > 0 &&
-                        rect.top >= 0 &&
-                        rect.top < 120 &&
-                        style.visibility !== 'hidden' &&
-                        style.display !== 'none'
-                    );
-                });
-                if (!buttons.length) return false;
-
-                // Rightmost button is usually the chat header 3-dots menu.
-                buttons.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
-                buttons[0].click();
-                return true;
-            }"""
-        )
-    )
+    return bool(await page.evaluate(JS_CLICK_ACTIVE_CHAT_MENU))
 
 
 async def _click_discussion_item(page: Page) -> bool:
-    return bool(
-        await page.evaluate(
-            """() => {
-                const pattern = /(view\\s*discussion|discussion|обсужд)/i;
-                const items = Array.from(document.querySelectorAll('.btn-menu-item')).filter((item) => {
-                    const rect = item.getBoundingClientRect();
-                    const style = window.getComputedStyle(item);
-                    return (
-                        rect.width > 0 &&
-                        rect.height > 0 &&
-                        style.visibility !== 'hidden' &&
-                        style.display !== 'none' &&
-                        item.offsetParent !== null
-                    );
-                });
-                const target = items.find((item) => pattern.test((item.textContent || '').replace(/\\s+/g, ' ').trim()));
-                if (!target) return false;
-                target.click();
-                return true;
-            }"""
-        )
-    )
+    return bool(await page.evaluate(JS_CLICK_DISCUSSION_MENU_ITEM))
 
 
 async def _click_leave_comment(page: Page) -> bool:
-    return bool(
-        await page.evaluate(
-            """() => {
-                const pattern = /(leave\\s+a\\s+comment|view\\s+comments|comments?|коммент|обсужд)/i;
-                const isVisible = (el) => {
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return (
-                        rect.width > 0 &&
-                        rect.height > 0 &&
-                        style.visibility !== 'hidden' &&
-                        style.display !== 'none'
-                    );
-                };
-                const chats = Array.from(document.querySelectorAll('.chat, .chat.tabs-tab'));
-                const active = chats.find((chat) => chat.classList.contains('active') && isVisible(chat))
-                    || chats.find((chat) => isVisible(chat));
-                if (!active) return false;
-
-                // Prefer explicit replies footer in channel posts.
-                const replies = Array.from(
-                    active.querySelectorAll('replies-element.replies-footer, .replies-footer, .replies-footer-text')
-                ).filter((el) => {
-                    const text = (el.textContent || '').replace(/\\s+/g, ' ').trim();
-                    return text && pattern.test(text) && isVisible(el);
-                });
-                if (replies.length) {
-                    replies.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
-                    replies[0].click();
-                    return true;
-                }
-
-                const candidates = Array.from(active.querySelectorAll('button, a, div, span')).filter((el) => {
-                    const text = (el.textContent || '').replace(/\\s+/g, ' ').trim();
-                    return text && pattern.test(text) && isVisible(el);
-                });
-                if (!candidates.length) return false;
-                candidates.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
-                candidates[0].click();
-                return true;
-            }"""
-        )
-    )
+    return bool(await page.evaluate(JS_CLICK_LEAVE_COMMENT_OR_COMMENTS))
 
 
 async def _click_discussion_anywhere(page: Page) -> bool:
-    return bool(
-        await page.evaluate(
-            """() => {
-                const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                const patternStrong = /(view\\s*discussion|open\\s*comments|leave\\s+a\\s+comment|обсужд|коммент)/i;
-                const patternWeak = /(comments?)/i;
-
-                const isVisible = (el) => {
-                    if (!(el instanceof Element)) return false;
-                    const rect = el.getBoundingClientRect();
-                    if (rect.width <= 0 || rect.height <= 0) return false;
-                    const style = window.getComputedStyle(el);
-                    return !(style.visibility === 'hidden' || style.display === 'none');
-                };
-
-                const isClickable = (el) => {
-                    if (!(el instanceof Element)) return false;
-                    if (el.matches('button, a, [role="button"], .btn-menu-item, .row-clickable, .rp')) return true;
-                    const onclickAttr = el.getAttribute('onclick');
-                    if (onclickAttr) return true;
-                    const style = window.getComputedStyle(el);
-                    return style.cursor === 'pointer';
-                };
-
-                const clickableAncestor = (el) => {
-                    let node = el;
-                    for (let i = 0; i < 6 && node; i += 1) {
-                        if (isClickable(node) && isVisible(node)) return node;
-                        node = node.parentElement;
-                    }
-                    return null;
-                };
-
-                const chats = Array.from(document.querySelectorAll('.chat, .chat.tabs-tab'));
-                const active = chats.find((chat) => chat.classList.contains('active') && isVisible(chat))
-                    || chats.find((chat) => {
-                        const rect = chat.getBoundingClientRect();
-                        const style = window.getComputedStyle(chat);
-                        return (
-                            rect.width > 260 &&
-                            rect.height > 260 &&
-                            style.display !== 'none' &&
-                            style.visibility !== 'hidden'
-                        );
-                    });
-                const roots = [
-                    ...(active ? [active] : []),
-                    ...Array.from(document.querySelectorAll('.btn-menu-item, .popup-container, .btn-menu')),
-                ];
-                if (!roots.length) roots.push(document.body);
-
-                const seen = new Set();
-                const candidates = [];
-                for (const root of roots) {
-                    const nodes = root.querySelectorAll('*');
-                    for (const node of nodes) {
-                        if (!(node instanceof Element) || !isVisible(node)) continue;
-                        const text = normalize(node.textContent);
-                        if (!text || text.length > 140) continue;
-                        if (!patternStrong.test(text) && !patternWeak.test(text)) continue;
-                        const clickable = clickableAncestor(node);
-                        if (!clickable) continue;
-                        if (seen.has(clickable)) continue;
-                        seen.add(clickable);
-
-                        let score = 0;
-                        if (/view\\s*discussion|обсужд/.test(text)) score += 50;
-                        if (/open\\s*comments|leave\\s+a\\s+comment|коммент/.test(text)) score += 30;
-                        if (/comments?/.test(text)) score += 10;
-                        if (clickable.matches('.btn-menu-item')) score += 20;
-                        if (clickable.matches('button, a')) score += 10;
-                        score -= Math.max(0, text.length - 40) / 10;
-                        candidates.push({clickable, score});
-                    }
-                }
-
-                candidates.sort((a, b) => b.score - a.score);
-                const target = candidates[0]?.clickable;
-                if (!target) return false;
-                target.click();
-                return true;
-            }"""
-        )
-    )
+    return bool(await page.evaluate(JS_CLICK_DISCUSSION_ANYWHERE))
 
 
 async def _click_discussion_via_playwright(page: Page) -> bool:
@@ -702,120 +314,23 @@ async def _click_discussion_via_playwright(page: Page) -> bool:
 
 async def _discussion_debug_snapshot(page: Page) -> str:
     try:
-        payload = await page.evaluate(
-            """() => {
-                const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-                const isVisible = (chat) => {
-                    const rect = chat.getBoundingClientRect();
-                    const style = window.getComputedStyle(chat);
-                    return (
-                        rect.width > 260 &&
-                        rect.height > 260 &&
-                        style.display !== 'none' &&
-                        style.visibility !== 'hidden'
-                    );
-                };
-                const chats = Array.from(document.querySelectorAll('.chat, .chat.tabs-tab'));
-                const active = chats.find((chat) => chat.classList.contains('active') && isVisible(chat))
-                    || chats.find((chat) => isVisible(chat));
-                const activeHeaderText = normalize(
-                    active?.querySelector('.chat-info-container, .sidebar-header.topbar')?.textContent || ''
-                );
-
-                const menuItems = Array.from(document.querySelectorAll('.btn-menu-item'))
-                    .map((el) => normalize(el.textContent))
-                    .filter(Boolean)
-                    .slice(0, 20);
-
-                const anchors = Array.from(document.querySelectorAll('a[href]'))
-                    .map((el) => ({
-                        href: normalize(el.getAttribute('href') || ''),
-                        text: normalize(el.textContent || '').slice(0, 120),
-                        cls: normalize(String(el.className || '')).slice(0, 120),
-                    }))
-                    .slice(0, 60);
-
-                const chatlistLike = anchors.filter((item) => /chatlist-chat|row-clickable|chatlist/.test(item.cls)).slice(0, 30);
-
-                const commentLike = Array.from(
-                    (active || document).querySelectorAll('button, a, div, span')
-                )
-                    .map((el) => normalize(el.textContent))
-                    .filter((t) => /(discussion|comment|обсужд|коммент)/i.test(t))
-                    .slice(0, 30);
-
-                const activeUrl = location.href;
-                return {
-                    active_url: activeUrl,
-                    active_header_text: activeHeaderText.slice(0, 220),
-                    menu_items: menuItems,
-                    discussion_like_texts: commentLike,
-                    anchors_count: anchors.length,
-                    anchors_sample: anchors.slice(0, 20),
-                    chatlist_links_sample: chatlistLike,
-                };
-            }"""
-        )
+        payload = await page.evaluate(JS_DISCUSSION_DEBUG_SNAPSHOT)
         return json.dumps(payload, ensure_ascii=False)
     except Exception as exc:
         return f"debug_collect_failed: {exc}"
 
 
 async def _open_group_info(page: Page) -> bool:
-    already_open = bool(
-        await page.evaluate(
-            """() => {
-                const sidebar = document.querySelector('.sidebar.sidebar-right');
-                if (!sidebar) return false;
-                const text = (sidebar.textContent || '').toLowerCase();
-                if (/channel info|информация о канале/.test(text)) return false;
-                if (/group info|информация о группе/.test(text)) return true;
-                return /members|участники/.test(text) && !!sidebar.querySelector('[data-peer-id]');
-            }"""
-        )
-    )
+    already_open = bool(await page.evaluate(JS_IS_GROUP_INFO_OPEN))
     if already_open:
         return True
 
-    clicked = bool(
-        await page.evaluate(
-            """() => {
-                const isVisible = (chat) => {
-                    const rect = chat.getBoundingClientRect();
-                    const style = window.getComputedStyle(chat);
-                    return (
-                        rect.width > 260 &&
-                        rect.height > 260 &&
-                        style.display !== 'none' &&
-                        style.visibility !== 'hidden'
-                    );
-                };
-                const chats = Array.from(document.querySelectorAll('.chat, .chat.tabs-tab'));
-                const active = chats.find((chat) => chat.classList.contains('active') && isVisible(chat))
-                    || chats.find((chat) => isVisible(chat));
-                const header = active?.querySelector('.chat-info-container, .sidebar-header.topbar');
-                if (!header) return false;
-                header.click();
-                return true;
-            }"""
-        )
-    )
+    clicked = bool(await page.evaluate(JS_OPEN_GROUP_INFO_BY_HEADER_CLICK))
     if not clicked:
         return False
 
     for _ in range(20):
-        ready = bool(
-            await page.evaluate(
-                """() => {
-                    const sidebar = document.querySelector('.sidebar.sidebar-right');
-                    if (!sidebar) return false;
-                    const text = (sidebar.textContent || '').toLowerCase();
-                    if (/channel info|информация о канале/.test(text)) return false;
-                    if (/group info|информация о группе/.test(text)) return true;
-                    return /members|участники/.test(text) && !!sidebar.querySelector('[data-peer-id]');
-                }"""
-            )
-        )
+        ready = bool(await page.evaluate(JS_IS_GROUP_INFO_OPEN))
         if ready:
             return True
         await page.wait_for_timeout(250)
@@ -823,63 +338,15 @@ async def _open_group_info(page: Page) -> bool:
 
 
 async def _maybe_subscribe(page: Page) -> bool:
-    return bool(
-        await page.evaluate(
-            """() => {
-                const pattern = /(subscribe|join|подпис|вступить)/i;
-                const buttons = Array.from(document.querySelectorAll('button, a'));
-                const target = buttons.find((el) => {
-                    const text = (el.textContent || '').replace(/\\s+/g, ' ').trim();
-                    if (!text || !pattern.test(text)) return false;
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-                });
-                if (!target) return false;
-                target.click();
-                return true;
-            }"""
-        )
-    )
+    return bool(await page.evaluate(JS_CLICK_SUBSCRIBE_OR_JOIN))
 
 
 async def _ensure_members_tab(page: Page) -> None:
-    await page.evaluate(
-        """() => {
-            const sidebar = document.querySelector('.sidebar.sidebar-right') || document;
-            const targets = Array.from(sidebar.querySelectorAll('nav *, [role="tab"], .tabs-with-icons *'));
-            const normalized = (text) => (text || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-            for (const node of targets) {
-                const text = normalized(node.textContent);
-                if (!text) continue;
-                if (text === 'members' || text === 'участники' || text.includes('members') || text.includes('участник')) {
-                    node.click();
-                    return;
-                }
-            }
-        }"""
-    )
+    await page.evaluate(JS_SELECT_MEMBERS_TAB)
 
 
 async def _extract_visible_members(page: Page) -> list[dict[str, str]]:
-    data = await page.evaluate(
-        """() => {
-            const rows = Array.from(
-                document.querySelectorAll(
-                    '.sidebar.sidebar-right a.chatlist-chat-abitbigger[data-peer-id], .sidebar.sidebar-right .chatlist-chat-abitbigger[data-peer-id], .sidebar.sidebar-right .chatlist-chat[data-peer-id]'
-                )
-            );
-            return rows.map((row) => {
-                const peerId = (row.getAttribute('data-peer-id') || '').trim();
-                const nameNode = row.querySelector('.fullName, .peer-title, .user-title, .title, .full-name');
-                const statusNode = row.querySelector('.subtitle, .status, .user-status, .user-last-seen');
-                const name = (nameNode?.textContent || '').replace(/\\s+/g, ' ').trim();
-                const status = (statusNode?.textContent || '').replace(/\\s+/g, ' ').trim();
-                const rawText = (row.textContent || '').replace(/\\s+/g, ' ').trim();
-                return { peer_id: peerId, name, status, raw_text: rawText };
-            });
-        }"""
-    )
+    data = await page.evaluate(JS_EXTRACT_VISIBLE_MEMBERS)
     members: list[dict[str, str]] = []
     for item in data:
         peer_id = (item.get("peer_id") or "").strip()
@@ -903,17 +370,7 @@ async def _extract_visible_members(page: Page) -> list[dict[str, str]]:
 async def _wait_for_members_list(page: Page, timeout_ms: int = 8_000) -> bool:
     rounds = max(4, timeout_ms // 250)
     for _ in range(rounds):
-        ready = bool(
-            await page.evaluate(
-                """() => {
-                    const sidebar = document.querySelector('.sidebar.sidebar-right');
-                    if (!sidebar) return false;
-                    return !!sidebar.querySelector(
-                        'a.chatlist-chat-abitbigger[data-peer-id], .chatlist-chat-abitbigger[data-peer-id], .chatlist-chat[data-peer-id]'
-                    );
-                }"""
-            )
-        )
+        ready = bool(await page.evaluate(JS_HAS_MEMBERS_LIST_ROWS))
         if ready:
             return True
         await _ensure_members_tab(page)
@@ -922,33 +379,14 @@ async def _wait_for_members_list(page: Page, timeout_ms: int = 8_000) -> bool:
 
 
 async def _scroll_members_list(page: Page) -> bool:
-    return bool(
-        await page.evaluate(
-            """() => {
-                const row = document.querySelector(
-                    '.sidebar.sidebar-right a.chatlist-chat-abitbigger[data-peer-id], .sidebar.sidebar-right .chatlist-chat-abitbigger[data-peer-id], .sidebar.sidebar-right .chatlist-chat[data-peer-id]'
-                );
-                if (!row) return false;
-                let container = row.parentElement;
-                while (container && container !== document.body) {
-                    if (container.scrollHeight > container.clientHeight + 4) {
-                        const previousTop = container.scrollTop;
-                        container.scrollTop = previousTop + Math.max(220, Math.floor(container.clientHeight * 0.85));
-                        return container.scrollTop > previousTop;
-                    }
-                    container = container.parentElement;
-                }
-                return false;
-            }"""
-        )
-    )
+    return bool(await page.evaluate(JS_SCROLL_MEMBERS_LIST))
 
 
 async def _collect_members(
-    page: Page,
-    max_scrolls: int,
-    stable_rounds: int,
-    scroll_pause_ms: int,
+        page: Page,
+        max_scrolls: int,
+        stable_rounds: int,
+        scroll_pause_ms: int,
 ) -> list[dict[str, str]]:
     collected: dict[str, dict[str, str]] = {}
     stable = 0
@@ -1051,13 +489,13 @@ def _discover_ws_debugger_url(cdp_endpoint: str, timeout_seconds: int = 5) -> st
 
 
 async def process_channel(
-    page: Page,
-    source_url: str,
-    timeout_ms: int,
-    max_scrolls: int,
-    stable_rounds: int,
-    scroll_pause_ms: int,
-    auto_subscribe: bool,
+        page: Page,
+        source_url: str,
+        timeout_ms: int,
+        max_scrolls: int,
+        stable_rounds: int,
+        scroll_pause_ms: int,
+        auto_subscribe: bool,
 ) -> list[dict[str, str]]:
     normalized = normalize_telegram_input_url(source_url)
     if not normalized:
@@ -1116,7 +554,8 @@ async def process_channel(
     opened, discussion_url = await _try_open_discussion(page, timeout_ms=timeout_ms)
     if not opened:
         # One more pass after stabilization/reload for flaky Telegram sessions.
-        await _stabilize_channel_view(page=page, source_url=normalized, timeout_ms=max(8_000, timeout_ms // 2), max_reloads=1)
+        await _stabilize_channel_view(page=page, source_url=normalized, timeout_ms=max(8_000, timeout_ms // 2),
+                                      max_reloads=1)
         opened, discussion_url = await _try_open_discussion(page, timeout_ms=timeout_ms)
     if not opened:
         debug_info = await _discussion_debug_snapshot(page)
@@ -1397,26 +836,7 @@ async def run() -> int:
             pass
 
         if args.mode == "persistent":
-            is_logged_in = bool(
-                await page.evaluate(
-                    """() => {
-                        const loginMarkers = [
-                            ...document.querySelectorAll('input, button, div, span')
-                        ].some((el) => {
-                            const text = (el.textContent || '').toLowerCase();
-                            return (
-                                text.includes('log in') ||
-                                text.includes('sign in') ||
-                                text.includes('войти') ||
-                                text.includes('phone number') ||
-                                text.includes('номер телефона')
-                            );
-                        });
-                        const chatListExists = !!document.querySelector('.chatlist-container, .tabs-container');
-                        return chatListExists && !loginMarkers;
-                    }"""
-                )
-            )
+            is_logged_in = bool(await page.evaluate(JS_IS_LOGGED_IN_TELEGRAM_WEB))
             if not is_logged_in:
                 wait_seconds = max(10, int(args.login_wait_seconds))
                 print(f"Ожидание ручного логина в Telegram Web: до {wait_seconds} сек.")
@@ -1425,26 +845,7 @@ async def run() -> int:
                 while elapsed < deadline_ms:
                     await page.wait_for_timeout(2000)
                     elapsed += 2000
-                    is_logged_in = bool(
-                        await page.evaluate(
-                            """() => {
-                                const loginMarkers = [
-                                    ...document.querySelectorAll('input, button, div, span')
-                                ].some((el) => {
-                                    const text = (el.textContent || '').toLowerCase();
-                                    return (
-                                        text.includes('log in') ||
-                                        text.includes('sign in') ||
-                                        text.includes('войти') ||
-                                        text.includes('phone number') ||
-                                        text.includes('номер телефона')
-                                    );
-                                });
-                                const chatListExists = !!document.querySelector('.chatlist-container, .tabs-container');
-                                return chatListExists && !loginMarkers;
-                            }"""
-                        )
-                    )
+                    is_logged_in = bool(await page.evaluate(JS_IS_LOGGED_IN_TELEGRAM_WEB))
                     if is_logged_in:
                         break
                 if not is_logged_in:
