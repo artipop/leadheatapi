@@ -140,28 +140,43 @@ JS_CLICK_BEST_CHAT_LINK = """([targetKey, targetUserNorm]) => {
 # Use sidebar search input and click best chat match by username when hash lookup fails.
 # language=javascript
 JS_SEARCH_AND_CLICK_CHAT_BY_USERNAME = """([rawUser, targetUserNorm]) => {
-    const inputs = Array.from(
-        document.querySelectorAll(
-            'input[type="text"], input, [contenteditable="true"][role="textbox"], [contenteditable="true"]'
-        )
-    );
-    const input = inputs.find((el) => {
+    const isVisible = (el) => {
         const rect = el.getBoundingClientRect();
         const style = window.getComputedStyle(el);
         return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-    });
+    };
+    const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+    const compact = (s) => normalize(s).replace(/[^a-z0-9а-яё]+/g, '');
+
+    const searchCandidates = Array.from(
+        document.querySelectorAll(
+            '.sidebar-left input[type="text"], .sidebar-left input,' +
+            '.chatlist-container input[type="text"], .chatlist-container input,' +
+            'input[placeholder*="Search" i], input[placeholder*="Поиск" i],' +
+            '[contenteditable="true"][data-placeholder*="Search" i],' +
+            '[contenteditable="true"][data-placeholder*="Поиск" i]'
+        )
+    ).filter((el) => isVisible(el));
+
+    const input = searchCandidates.find((el) => {
+        const ph = normalize(el.getAttribute('placeholder') || el.getAttribute('aria-label') || el.getAttribute('data-placeholder') || '');
+        return ph.includes('search') || ph.includes('поиск') || ph.includes('find');
+    }) || searchCandidates[0];
+
     if (!input) return false;
 
     input.focus();
     if ('value' in input) {
+        input.value = '';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
         input.value = rawUser;
     } else {
+        input.textContent = '';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
         input.textContent = rawUser;
     }
     input.dispatchEvent(new Event('input', { bubbles: true }));
 
-    const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-    const compact = (s) => normalize(s).replace(/[^a-z0-9а-яё]+/g, '');
     const links = Array.from(document.querySelectorAll('a[href], .chatlist-chat'));
     let best = null;
     let bestScore = -1;
@@ -189,6 +204,63 @@ JS_SEARCH_AND_CLICK_CHAT_BY_USERNAME = """([rawUser, targetUserNorm]) => {
         return true;
     }
     return false;
+}"""
+
+# Prefer exact click on a global-search result matching @username.
+# Returns clicked row href (often "#-<peer_id>") or empty string.
+# language=javascript
+JS_CLICK_SEARCH_RESULT_BY_USERNAME = """([rawUser, targetUserNorm]) => {
+    const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+    const compact = (s) => normalize(s).replace(/[^a-z0-9а-яё]+/g, '');
+    const isVisible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+
+    const atUser = `@${normalize(rawUser).replace(/^@+/, '')}`;
+    const searchInput = Array.from(
+        document.querySelectorAll(
+            '.sidebar-left input[type="text"], .sidebar-left input,' +
+            '.chatlist-container input[type="text"], .chatlist-container input,' +
+            'input[placeholder*="Search" i], input[placeholder*="Поиск" i]'
+        )
+    ).find((el) => isVisible(el));
+    if (!searchInput) return '';
+
+    searchInput.focus();
+    searchInput.value = '';
+    searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+    searchInput.value = normalize(rawUser).replace(/^@+/, '');
+    searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+
+    const rows = Array.from(
+        document.querySelectorAll(
+            '.chatlist .chatlist-chat, .chatlist a[href], .search-super-container a[href], .search-super-container .chatlist-chat'
+        )
+    ).filter((row) => isVisible(row));
+
+    let best = null;
+    let bestScore = -1;
+    for (const row of rows) {
+        const text = normalize(row.textContent || '');
+        const href = normalize(row.getAttribute('href') || '');
+        if (!text && !href) continue;
+        let score = 0;
+        if (href.includes(atUser)) score += 120;
+        if (text.includes(atUser)) score += 120;
+        if (targetUserNorm && compact(text).includes(targetUserNorm)) score += 50;
+        if (String(row.className || '').includes('chatlist-chat')) score += 20;
+        if (score > bestScore) {
+            best = row;
+            bestScore = score;
+        }
+    }
+
+    if (!best || bestScore < 60) return '';
+    const clickedHref = (best.getAttribute('href') || '').trim();
+    best.click();
+    return clickedHref;
 }"""
 
 # Detect whether current view already looks like discussion/group chat.
@@ -517,16 +589,50 @@ JS_CLICK_SUBSCRIBE_OR_JOIN = """() => {
 # language=javascript
 JS_SELECT_MEMBERS_TAB = """() => {
     const sidebar = document.querySelector('.sidebar.sidebar-right') || document;
-    const targets = Array.from(sidebar.querySelectorAll('nav *, [role="tab"], .tabs-with-icons *'));
     const normalized = (text) => (text || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-    for (const node of targets) {
-        const text = normalized(node.textContent);
-        if (!text) continue;
-        if (text === 'members' || text === 'участники' || text.includes('members') || text.includes('участник')) {
-            node.click();
-            return;
+    const isVisible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.display !== 'none' &&
+            style.visibility !== 'hidden'
+        );
+    };
+    const isClickable = (el) => {
+        if (!el) return false;
+        if (el.matches('button, a, [role="tab"], [role="button"]')) return true;
+        const cls = String(el.className || '');
+        if (/row-clickable|rp|menu-horizontal-div-item|tabs|tab/i.test(cls)) return true;
+        const style = window.getComputedStyle(el);
+        return style.cursor === 'pointer';
+    };
+    const clickableAncestor = (el) => {
+        let node = el;
+        for (let i = 0; i < 6 && node; i += 1) {
+            if (isClickable(node) && isVisible(node)) return node;
+            node = node.parentElement;
         }
+        return null;
+    };
+
+    const pool = Array.from(sidebar.querySelectorAll('*'));
+    const candidates = [];
+    for (const node of pool) {
+        if (!isVisible(node)) continue;
+        const text = normalized(node.textContent);
+        if (!text || text.length > 48) continue;
+        if (!(text === 'members' || text === 'участники' || text.includes('members') || text.includes('участник'))) {
+            continue;
+        }
+        const target = clickableAncestor(node);
+        if (!target) continue;
+        candidates.push(target);
     }
+    if (!candidates.length) return false;
+    candidates[0].click();
+    return true;
 }"""
 
 # Extract visible members rows from sidebar list.
@@ -534,11 +640,20 @@ JS_SELECT_MEMBERS_TAB = """() => {
 JS_EXTRACT_VISIBLE_MEMBERS = """() => {
     const rows = Array.from(
         document.querySelectorAll(
-            '.sidebar.sidebar-right a.chatlist-chat-abitbigger[data-peer-id], .sidebar.sidebar-right .chatlist-chat-abitbigger[data-peer-id], .sidebar.sidebar-right .chatlist-chat[data-peer-id]'
+            '.sidebar.sidebar-right .search-super-container-members a.chatlist-chat-abitbigger,' +
+            '.sidebar.sidebar-right .search-super-container-members .chatlist-chat-abitbigger,' +
+            '.sidebar.sidebar-right .search-super-container-members .chatlist-chat,' +
+            '.sidebar.sidebar-right a.chatlist-chat-abitbigger[data-peer-id],' +
+            '.sidebar.sidebar-right .chatlist-chat-abitbigger[data-peer-id],' +
+            '.sidebar.sidebar-right .chatlist-chat[data-peer-id]'
         )
     );
     return rows.map((row) => {
-        const peerId = (row.getAttribute('data-peer-id') || '').trim();
+        const peerId = (
+            row.getAttribute('data-peer-id') ||
+            row.querySelector('[data-peer-id]')?.getAttribute('data-peer-id') ||
+            ''
+        ).trim();
         const nameNode = row.querySelector('.fullName, .peer-title, .user-title, .title, .full-name');
         const statusNode = row.querySelector('.subtitle, .status, .user-status, .user-last-seen');
         const name = (nameNode?.textContent || '').replace(/\\s+/g, ' ').trim();
@@ -553,8 +668,10 @@ JS_EXTRACT_VISIBLE_MEMBERS = """() => {
 JS_HAS_MEMBERS_LIST_ROWS = """() => {
     const sidebar = document.querySelector('.sidebar.sidebar-right');
     if (!sidebar) return false;
-    return !!sidebar.querySelector(
-        'a.chatlist-chat-abitbigger[data-peer-id], .chatlist-chat-abitbigger[data-peer-id], .chatlist-chat[data-peer-id]'
+    const memberContainer = sidebar.querySelector('.search-super-container-members.tabs-tab.active, .search-super-container-members');
+    if (!memberContainer) return false;
+    return !!memberContainer.querySelector(
+        '[data-peer-id], a.chatlist-chat-abitbigger, .chatlist-chat-abitbigger, .chatlist-chat'
     );
 }"""
 
@@ -562,7 +679,13 @@ JS_HAS_MEMBERS_LIST_ROWS = """() => {
 # language=javascript
 JS_SCROLL_MEMBERS_LIST = """() => {
     const row = document.querySelector(
-        '.sidebar.sidebar-right a.chatlist-chat-abitbigger[data-peer-id], .sidebar.sidebar-right .chatlist-chat-abitbigger[data-peer-id], .sidebar.sidebar-right .chatlist-chat[data-peer-id]'
+        '.sidebar.sidebar-right .search-super-container-members [data-peer-id],' +
+        '.sidebar.sidebar-right .search-super-container-members a.chatlist-chat-abitbigger,' +
+        '.sidebar.sidebar-right .search-super-container-members .chatlist-chat-abitbigger,' +
+        '.sidebar.sidebar-right .search-super-container-members .chatlist-chat,' +
+        '.sidebar.sidebar-right a.chatlist-chat-abitbigger[data-peer-id],' +
+        '.sidebar.sidebar-right .chatlist-chat-abitbigger[data-peer-id],' +
+        '.sidebar.sidebar-right .chatlist-chat[data-peer-id]'
     );
     if (!row) return false;
     let container = row.parentElement;
