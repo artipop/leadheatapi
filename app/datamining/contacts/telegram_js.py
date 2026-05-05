@@ -59,210 +59,6 @@ JS_CHANNEL_RUNTIME_STATE = """() => {
     };
 }"""
 
-# Pick best matching chatlist href for target channel hash/username.
-# language=javascript
-JS_FIND_BEST_CHAT_HREF = """([targetKey, targetUserNorm]) => {
-    const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-    const compact = (s) => normalize(s).replace(/[^a-z0-9а-яё]+/g, '');
-    const links = Array.from(document.querySelectorAll('a[href]'));
-    let best = null;
-    let bestScore = -1;
-    for (const link of links) {
-        const href = normalize(link.getAttribute('href') || '');
-        const text = normalize(link.textContent || '');
-        const textCompact = compact(text);
-        if (!href && !text) continue;
-        let score = 0;
-        if (targetKey && href.includes(targetKey)) score += 100;
-        if (targetUserNorm && textCompact.includes(targetUserNorm)) score += 40;
-        if (link.className && String(link.className).includes('chatlist-chat')) score += 20;
-        const rect = link.getBoundingClientRect();
-        const style = window.getComputedStyle(link);
-        const visible =
-            rect.width > 0 &&
-            rect.height > 0 &&
-            style.visibility !== 'hidden' &&
-            style.display !== 'none';
-        if (!visible) score -= 100;
-        if (score > bestScore) {
-            best = link;
-            bestScore = score;
-        }
-    }
-    if (best && bestScore > 20) {
-        return best.getAttribute('href') || '';
-    }
-    return '';
-}"""
-
-# Click best matching chatlist row directly in DOM scoring by target hash/username.
-# language=javascript
-JS_CLICK_BEST_CHAT_LINK = """([targetKey, targetUserNorm]) => {
-    const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-    const compact = (s) => normalize(s).replace(/[^a-z0-9а-яё]+/g, '');
-    const links = Array.from(document.querySelectorAll('a[href]'));
-    let best = null;
-    let bestScore = -1;
-
-    for (const link of links) {
-        const href = normalize(link.getAttribute('href') || '');
-        const text = normalize(link.textContent || '');
-        const textCompact = compact(text);
-        if (!href && !text) continue;
-
-        let score = 0;
-        if (targetKey && href.includes(targetKey)) score += 100;
-        if (targetUserNorm && textCompact.includes(targetUserNorm)) score += 40;
-        if (link.className && String(link.className).includes('chatlist-chat')) score += 20;
-
-        const rect = link.getBoundingClientRect();
-        const style = window.getComputedStyle(link);
-        const visible =
-            rect.width > 0 &&
-            rect.height > 0 &&
-            style.visibility !== 'hidden' &&
-            style.display !== 'none';
-        if (!visible) score -= 100;
-
-        if (score > bestScore) {
-            best = link;
-            bestScore = score;
-        }
-    }
-
-    if (best && bestScore > 20) {
-        best.click();
-        return true;
-    }
-    return false;
-}"""
-
-# Use sidebar search input and click best chat match by username when hash lookup fails.
-# language=javascript
-JS_SEARCH_AND_CLICK_CHAT_BY_USERNAME = """([rawUser, targetUserNorm]) => {
-    const isVisible = (el) => {
-        const rect = el.getBoundingClientRect();
-        const style = window.getComputedStyle(el);
-        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-    };
-    const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-    const compact = (s) => normalize(s).replace(/[^a-z0-9а-яё]+/g, '');
-
-    const searchCandidates = Array.from(
-        document.querySelectorAll(
-            '.sidebar-left input[type="text"], .sidebar-left input,' +
-            '.chatlist-container input[type="text"], .chatlist-container input,' +
-            'input[placeholder*="Search" i], input[placeholder*="Поиск" i],' +
-            '[contenteditable="true"][data-placeholder*="Search" i],' +
-            '[contenteditable="true"][data-placeholder*="Поиск" i]'
-        )
-    ).filter((el) => isVisible(el));
-
-    const input = searchCandidates.find((el) => {
-        const ph = normalize(el.getAttribute('placeholder') || el.getAttribute('aria-label') || el.getAttribute('data-placeholder') || '');
-        return ph.includes('search') || ph.includes('поиск') || ph.includes('find');
-    }) || searchCandidates[0];
-
-    if (!input) return false;
-
-    input.focus();
-    if ('value' in input) {
-        input.value = '';
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.value = rawUser;
-    } else {
-        input.textContent = '';
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.textContent = rawUser;
-    }
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-
-    const links = Array.from(document.querySelectorAll('a[href], .chatlist-chat'));
-    let best = null;
-    let bestScore = -1;
-    for (const link of links) {
-        const text = normalize(link.textContent || '');
-        const textCompact = compact(text);
-        if (!text) continue;
-        let score = 0;
-        if (targetUserNorm && textCompact.includes(targetUserNorm)) score += 80;
-        const rect = link.getBoundingClientRect();
-        const style = window.getComputedStyle(link);
-        const visible =
-            rect.width > 0 &&
-            rect.height > 0 &&
-            style.visibility !== 'hidden' &&
-            style.display !== 'none';
-        if (!visible) score -= 100;
-        if (score > bestScore) {
-            best = link;
-            bestScore = score;
-        }
-    }
-    if (best && bestScore > 20) {
-        best.click();
-        return true;
-    }
-    return false;
-}"""
-
-# Prefer exact click on a global-search result matching @username.
-# Returns clicked row href (often "#-<peer_id>") or empty string.
-# language=javascript
-JS_CLICK_SEARCH_RESULT_BY_USERNAME = """([rawUser, targetUserNorm]) => {
-    const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-    const compact = (s) => normalize(s).replace(/[^a-z0-9а-яё]+/g, '');
-    const isVisible = (el) => {
-        const rect = el.getBoundingClientRect();
-        const style = window.getComputedStyle(el);
-        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-    };
-
-    const atUser = `@${normalize(rawUser).replace(/^@+/, '')}`;
-    const searchInput = Array.from(
-        document.querySelectorAll(
-            '.sidebar-left input[type="text"], .sidebar-left input,' +
-            '.chatlist-container input[type="text"], .chatlist-container input,' +
-            'input[placeholder*="Search" i], input[placeholder*="Поиск" i]'
-        )
-    ).find((el) => isVisible(el));
-    if (!searchInput) return '';
-
-    searchInput.focus();
-    searchInput.value = '';
-    searchInput.dispatchEvent(new Event('input', { bubbles: true }));
-    searchInput.value = normalize(rawUser).replace(/^@+/, '');
-    searchInput.dispatchEvent(new Event('input', { bubbles: true }));
-
-    const rows = Array.from(
-        document.querySelectorAll(
-            '.chatlist .chatlist-chat, .chatlist a[href], .search-super-container a[href], .search-super-container .chatlist-chat'
-        )
-    ).filter((row) => isVisible(row));
-
-    let best = null;
-    let bestScore = -1;
-    for (const row of rows) {
-        const text = normalize(row.textContent || '');
-        const href = normalize(row.getAttribute('href') || '');
-        if (!text && !href) continue;
-        let score = 0;
-        if (href.includes(atUser)) score += 120;
-        if (text.includes(atUser)) score += 120;
-        if (targetUserNorm && compact(text).includes(targetUserNorm)) score += 50;
-        if (String(row.className || '').includes('chatlist-chat')) score += 20;
-        if (score > bestScore) {
-            best = row;
-            bestScore = score;
-        }
-    }
-
-    if (!best || bestScore < 60) return '';
-    const clickedHref = (best.getAttribute('href') || '').trim();
-    best.click();
-    return clickedHref;
-}"""
-
 # Detect whether current view already looks like discussion/group chat.
 # language=javascript
 JS_IS_GROUP_CHAT_OPEN = """() => {
@@ -375,6 +171,25 @@ JS_CLICK_LEAVE_COMMENT_OR_COMMENTS = """() => {
         || chats.find((chat) => isVisible(chat));
     if (!active) return false;
 
+    const isClickable = (el) => {
+        if (!(el instanceof Element)) return false;
+        if (el.matches('button, a, [role="button"], [role="link"], .row-clickable, .rp, .btn, .ripple-handler')) {
+            return true;
+        }
+        const cls = String(el.className || '');
+        if (/row-clickable|rp|btn|ripple|replies-footer|clickable/i.test(cls)) return true;
+        const style = window.getComputedStyle(el);
+        return style.cursor === 'pointer' || !!el.getAttribute('onclick');
+    };
+    const clickableAncestor = (el) => {
+        let node = el;
+        for (let i = 0; i < 8 && node; i += 1) {
+            if (isClickable(node) && isVisible(node)) return node;
+            node = node.parentElement;
+        }
+        return null;
+    };
+
     const replies = Array.from(
         active.querySelectorAll('replies-element.replies-footer, .replies-footer, .replies-footer-text')
     ).filter((el) => {
@@ -383,7 +198,8 @@ JS_CLICK_LEAVE_COMMENT_OR_COMMENTS = """() => {
     });
     if (replies.length) {
         replies.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
-        replies[0].click();
+        const target = clickableAncestor(replies[0]) || replies[0];
+        target.click();
         return true;
     }
 
@@ -393,7 +209,8 @@ JS_CLICK_LEAVE_COMMENT_OR_COMMENTS = """() => {
     });
     if (!candidates.length) return false;
     candidates.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
-    candidates[0].click();
+    const target = clickableAncestor(candidates[0]) || candidates[0];
+    target.click();
     return true;
 }"""
 
@@ -638,6 +455,16 @@ JS_SELECT_MEMBERS_TAB = """() => {
 # Extract visible members rows from sidebar list.
 # language=javascript
 JS_EXTRACT_VISIBLE_MEMBERS = """() => {
+    const extractUsername = (value) => {
+        const text = String(value || '');
+        const linkMatch = text.match(/(?:https?:\\/\\/)?(?:t\\.me|telegram\\.me)\\/(@?[A-Za-z0-9_]{5,32})(?:[/?#]|$)/i);
+        if (linkMatch) return linkMatch[1].replace(/^@/, '');
+        const hashMatch = text.match(/#@([A-Za-z0-9_]{5,32})(?:[/?#]|$)/);
+        if (hashMatch) return hashMatch[1];
+        const mentionMatch = text.match(/@([A-Za-z0-9_]{5,32})/);
+        if (mentionMatch) return mentionMatch[1];
+        return '';
+    };
     const rows = Array.from(
         document.querySelectorAll(
             '.sidebar.sidebar-right .search-super-container-members a.chatlist-chat-abitbigger,' +
@@ -659,8 +486,71 @@ JS_EXTRACT_VISIBLE_MEMBERS = """() => {
         const name = (nameNode?.textContent || '').replace(/\\s+/g, ' ').trim();
         const status = (statusNode?.textContent || '').replace(/\\s+/g, ' ').trim();
         const rawText = (row.textContent || '').replace(/\\s+/g, ' ').trim();
-        return { peer_id: peerId, name, status, raw_text: rawText };
+        const href = (
+            row.getAttribute('href') ||
+            row.querySelector('a[href]')?.getAttribute('href') ||
+            ''
+        ).trim();
+        const username = extractUsername(`${href} ${rawText}`);
+        return {
+            peer_id: peerId,
+            name,
+            status,
+            raw_text: rawText,
+            href,
+            username,
+            public_url: username ? `https://t.me/${username}` : '',
+        };
     });
+}"""
+
+# Try to resolve public usernames from Telegram Web runtime stores by internal peer id.
+# This is much faster and less fragile than opening each profile card, but Telegram
+# Web does not expose these globals consistently across builds, so it is best-effort.
+# language=javascript
+JS_EXTRACT_USERNAMES_BY_PEER_IDS = """async (peerIds) => {
+    const ids = Array.from(new Set((peerIds || []).map((id) => String(id || '').trim()).filter(Boolean)));
+    const output = {};
+    const normalizeUsername = (value) => {
+        const username = String(value || '').replace(/^@/, '').trim();
+        if (!/^[A-Za-z0-9_]{5,32}$/.test(username)) return '';
+        return username;
+    };
+    const assign = (peerId, value) => {
+        const username = normalizeUsername(value);
+        if (username && !output[peerId]) {
+            output[peerId] = { username, public_url: `https://t.me/${username}` };
+        }
+    };
+    const readUser = (peerId, user) => {
+        if (!user || typeof user !== 'object') return;
+        assign(peerId, user.username);
+        assign(peerId, user.usernames?.[0]?.username);
+        assign(peerId, user.usernames?.[0]);
+        assign(peerId, user.user?.username);
+        assign(peerId, user._?.username);
+    };
+    const managers = [
+        window.appUsersManager,
+        window.managers?.appUsersManager,
+        window.managers?.users,
+        window.telegram?.appUsersManager,
+        window.Telegram?.appUsersManager,
+    ].filter(Boolean);
+
+    for (const peerId of ids) {
+        for (const manager of managers) {
+            try {
+                if (typeof manager.getUser === 'function') readUser(peerId, await manager.getUser(peerId));
+                if (typeof manager.getUserById === 'function') readUser(peerId, await manager.getUserById(peerId));
+                if (typeof manager.get === 'function') readUser(peerId, await manager.get(peerId));
+                readUser(peerId, manager.users?.[peerId]);
+                readUser(peerId, manager.users?.get?.(peerId));
+            } catch (_) {}
+            if (output[peerId]) break;
+        }
+    }
+    return output;
 }"""
 
 # Check if members list rows are already rendered.
@@ -696,6 +586,115 @@ JS_SCROLL_MEMBERS_LIST = """() => {
             return container.scrollTop > previousTop;
         }
         container = container.parentElement;
+    }
+    return false;
+}"""
+
+# Click a visible member row in the right sidebar by Telegram internal peer id.
+# Used only for optional profile enrichment; rows may be virtualized, so this
+# works for currently rendered members and callers should invoke it before
+# scrolling away from the visible batch.
+# language=javascript
+JS_CLICK_VISIBLE_MEMBER_BY_PEER_ID = """(peerId) => {
+    const selector = [
+        '.sidebar.sidebar-right .search-super-container-members a.chatlist-chat-abitbigger',
+        '.sidebar.sidebar-right .search-super-container-members .chatlist-chat-abitbigger',
+        '.sidebar.sidebar-right .search-super-container-members .chatlist-chat',
+        '.sidebar.sidebar-right .search-super-container-members [data-peer-id]',
+        '.sidebar.sidebar-right a.chatlist-chat-abitbigger[data-peer-id]',
+        '.sidebar.sidebar-right .chatlist-chat-abitbigger[data-peer-id]',
+        '.sidebar.sidebar-right .chatlist-chat[data-peer-id]'
+    ].join(',');
+    const rows = Array.from(document.querySelectorAll(selector));
+    const isVisible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    const row = rows.find((el) => {
+        const value = el.getAttribute('data-peer-id') || el.querySelector('[data-peer-id]')?.getAttribute('data-peer-id') || '';
+        return value.trim() === String(peerId || '').trim() && isVisible(el);
+    });
+    if (!row) return false;
+    row.click();
+    return true;
+}"""
+
+# Extract a public username from an opened Telegram user profile/sidebar when visible.
+# Telegram Web changes DOM class names often, so this intentionally combines href
+# extraction with text heuristics for @username and t.me links.
+# language=javascript
+JS_EXTRACT_OPEN_USER_PROFILE_USERNAME = """() => {
+    const containers = Array.from(document.querySelectorAll(
+        '.sidebar.sidebar-right, .popup, .profile, .user-profile, .chat-info'
+    ));
+    const visibleContainers = containers.filter((el) => {
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 120 && rect.height > 120 && style.display !== 'none' && style.visibility !== 'hidden';
+    });
+    const root = visibleContainers[visibleContainers.length - 1] || document.body;
+    const ignore = new Set([
+        'joinchat', 'share', 'addstickers', 'proxy', 'iv', 's', 'c'
+    ]);
+    const normalizeUsername = (value) => {
+        const match = String(value || '').match(/@?([A-Za-z0-9_]{5,32})/);
+        if (!match) return '';
+        const username = match[1];
+        if (ignore.has(username.toLowerCase())) return '';
+        return username;
+    };
+
+    const anchors = Array.from(root.querySelectorAll('a[href]'));
+    for (const anchor of anchors) {
+        const href = anchor.getAttribute('href') || '';
+        const text = anchor.textContent || '';
+        const linkMatch = href.match(/(?:https?:\\/\\/)?(?:t\\.me|telegram\\.me)\\/(@?[A-Za-z0-9_]{5,32})(?:[/?#]|$)/i);
+        if (linkMatch) {
+            const username = normalizeUsername(linkMatch[1]);
+            if (username) return { username, public_url: `https://t.me/${username}` };
+        }
+        const textMatch = text.match(/@([A-Za-z0-9_]{5,32})/);
+        if (textMatch) {
+            const username = normalizeUsername(textMatch[1]);
+            if (username) return { username, public_url: `https://t.me/${username}` };
+        }
+    }
+
+    const text = (root.textContent || '').replace(/\\s+/g, ' ');
+    const textMatch = text.match(/@([A-Za-z0-9_]{5,32})/);
+    if (textMatch) {
+        const username = normalizeUsername(textMatch[1]);
+        if (username) return { username, public_url: `https://t.me/${username}` };
+    }
+    return { username: '', public_url: '' };
+}"""
+
+# Return from an opened user profile back to the group info/members sidebar.
+# language=javascript
+JS_CLOSE_OPEN_USER_PROFILE = """() => {
+    const visible = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    const candidates = Array.from(document.querySelectorAll(
+        '.sidebar.sidebar-right button, .sidebar.sidebar-right .btn-icon, .sidebar.sidebar-right [role="button"], .popup button, .popup [role="button"]'
+    ));
+    const backOrClose = candidates.find((el) => {
+        if (!visible(el)) return false;
+        const label = [
+            el.getAttribute('aria-label') || '',
+            el.getAttribute('title') || '',
+            el.className || '',
+            el.textContent || ''
+        ].join(' ').toLowerCase();
+        return /back|назад|close|закрыть|btn-menu-toggle|tgico-left|tgico-close/.test(label);
+    });
+    if (backOrClose) {
+        backOrClose.click();
+        return true;
     }
     return false;
 }"""

@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
@@ -19,13 +20,15 @@ from telegram_js import (
     JS_CHANNEL_RUNTIME_STATE,
     JS_CLICK_ACTIVE_CHAT_MENU,
     JS_CLICK_DISCUSSION_ANYWHERE,
-    JS_CLICK_SEARCH_RESULT_BY_USERNAME,
     JS_CLICK_DISCUSSION_MENU_ITEM,
+    JS_CLICK_VISIBLE_MEMBER_BY_PEER_ID,
+    JS_CLOSE_OPEN_USER_PROFILE,
     JS_CLICK_LEAVE_COMMENT_OR_COMMENTS,
     JS_CLICK_SUBSCRIBE_OR_JOIN,
     JS_DISCUSSION_DEBUG_SNAPSHOT,
+    JS_EXTRACT_OPEN_USER_PROFILE_USERNAME,
+    JS_EXTRACT_USERNAMES_BY_PEER_IDS,
     JS_EXTRACT_VISIBLE_MEMBERS,
-    JS_FIND_BEST_CHAT_HREF,
     JS_HAS_MEMBERS_LIST_ROWS,
     JS_IS_ACTIVE_CHAT_OPEN,
     JS_IS_GROUP_CHAT_OPEN,
@@ -123,6 +126,58 @@ def _extract_hash_key(url: str) -> str:
     return fragment.strip()
 
 
+def _username_from_telegram_web_url(url: str) -> str:
+    key = _extract_hash_key(url)
+    match = re.fullmatch(r"@([A-Za-z0-9_]{5,32})", key)
+    return match.group(1) if match else ""
+
+
+def _canonical_telegram_web_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+    except Exception:
+        return url
+    if (parsed.hostname or "").lower() != "web.telegram.org" or parsed.path.rstrip("/") != "/k":
+        return url
+    fragment = (parsed.fragment or "").strip()
+    if not fragment:
+        return "https://web.telegram.org/k/"
+    return urlunsplit(("https", "web.telegram.org", "/k/", "", fragment))
+
+
+async def _navigate_to_channel_url(page: Page, normalized_url: str, timeout_ms: int) -> None:
+    target_key = _extract_hash_key(normalized_url)
+    if target_key:
+        # Telegram Web ignores in-page hash changes in some sessions; a cache-busted goto reloads the route.
+        navigation_url = urlunsplit(
+            ("https", "web.telegram.org", "/k/", f"agent_nav={time.time_ns()}", target_key)
+        )
+    else:
+        navigation_url = normalized_url
+
+    last_error: Exception | None = None
+    for _ in range(3):
+        try:
+            await page.goto(navigation_url, wait_until="commit", timeout=min(timeout_ms, 12_000))
+        except Exception as exc:
+            last_error = exc
+        await page.wait_for_timeout(1_200)
+
+        current_key = _extract_hash_key(page.url).lower()
+        if target_key and current_key == target_key.lower():
+            return
+        if not target_key and _canonical_telegram_web_url(page.url) == _canonical_telegram_web_url(normalized_url):
+            return
+
+        if target_key:
+            navigation_url = urlunsplit(
+                ("https", "web.telegram.org", "/k/", f"agent_nav={time.time_ns()}", target_key)
+            )
+
+    if last_error is not None:
+        raise last_error
+
+
 async def _is_active_chat_open(page: Page) -> bool:
     try:
         return bool(await page.evaluate(JS_IS_ACTIVE_CHAT_OPEN))
@@ -162,11 +217,10 @@ async def _stabilize_channel_view(
         if state.get("waiting_network") and reloads_left > 0:
             reloads_left -= 1
             try:
-                await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+                await page.reload(wait_until="commit", timeout=min(timeout_ms, 12_000))
                 await page.wait_for_timeout(1_200)
                 if source_url:
-                    await page.goto(source_url, wait_until="domcontentloaded", timeout=timeout_ms)
-                    await page.wait_for_timeout(1_000)
+                    await _navigate_to_channel_url(page, normalized_url=source_url, timeout_ms=timeout_ms)
             except Exception:
                 pass
 
@@ -217,18 +271,22 @@ async def _ensure_channel_open(page: Page, normalized_url: str, timeout_ms: int)
     target_key = _extract_hash_key(normalized_url).lower()
     target_username = target_key[1:] if target_key.startswith("@") else target_key
     target_username_norm = re.sub(r"[^a-z0-9а-яё]+", "", target_username.lower())
-    is_username_target = target_key.startswith("@")
-    initial_active_href = await _get_active_chatlist_href(page)
 
-    async def is_target_chat_open(clicked_href: str = "") -> bool:
+    async def is_target_chat_open() -> bool:
         if not await _is_active_chat_open(page):
             return False
         try:
             return bool(
                 await page.evaluate(
-                    """([targetKey, targetUserNorm, clickedHref, initialHref]) => {
+                    """([targetKey, targetUserNorm]) => {
                         const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
                         const compact = (s) => normalize(s).replace(/[^a-z0-9а-яё]+/g, '');
+                        const normalizeHash = (s) => {
+                            let value = normalize(s || '');
+                            if (value.startsWith('/')) value = value.slice(1);
+                            if (value.startsWith('#')) value = value.slice(1);
+                            return value;
+                        };
 
                         const chats = Array.from(document.querySelectorAll('.chat, .chat.tabs-tab'));
                         const isVisible = (chat) => {
@@ -252,21 +310,18 @@ async def _ensure_channel_open(page: Page, normalized_url: str, timeout_ms: int)
                         const activeListRow = document.querySelector('a.chatlist-chat.active, .chatlist-chat.active');
                         const activeHref = normalize(activeListRow?.getAttribute?.('href') || '');
                         const activeText = compact(activeListRow?.textContent || '');
-                        if (clickedHref && activeHref && activeHref === normalize(clickedHref)) return true;
+                        const currentHash = normalizeHash(location.hash || '');
+                        const normalizedTarget = normalizeHash(targetKey || '');
 
                         // Numeric hash targets can be validated directly.
-                        let currentHash = normalize(location.hash || '');
-                        if (currentHash.startsWith('/')) currentHash = currentHash.slice(1);
-                        if (targetKey && targetKey.startsWith('-') && currentHash.endsWith(targetKey)) return true;
-                        if (targetKey && targetKey.startsWith('-') && activeHref.endsWith(targetKey)) return true;
+                        if (normalizedTarget && normalizedTarget.startsWith('-') && currentHash.endsWith(normalizedTarget)) return true;
+                        if (normalizedTarget && normalizedTarget.startsWith('-') && activeHref.endsWith(normalizedTarget)) return true;
 
-                        // Username targets: prefer text match, but accept exact hash when chat is rendered.
-                        if (targetKey && targetKey.startsWith('@')) {
+                        // Username targets should be opened by page.goto(hash).
+                        if (normalizedTarget && normalizedTarget.startsWith('@')) {
                             if (targetUserNorm && activeText.includes(targetUserNorm)) return true;
                             if (targetUserNorm && headerText.includes(targetUserNorm)) return true;
-                            let currentHash = normalize(location.hash || '');
-                            if (currentHash.startsWith('/')) currentHash = currentHash.slice(1);
-                            if (currentHash === normalize(targetKey) && headerText.length > 2) {
+                            if (currentHash === normalizedTarget && headerText.length > 2) {
                                 return true;
                             }
                             return false;
@@ -275,49 +330,17 @@ async def _ensure_channel_open(page: Page, normalized_url: str, timeout_ms: int)
                         if (targetUserNorm && headerText.includes(targetUserNorm)) return true;
                         return false;
                     }""",
-                    [target_key, target_username_norm, clicked_href, initial_active_href],
+                    [target_key, target_username_norm],
                 )
             )
         except Exception:
             return False
 
-    clicked_target_href = ""
-    # Give direct hash navigation a short chance before touching search UI.
-    direct_rounds = max(6, timeout_ms // 900)
-    for _ in range(direct_rounds):
-        if await is_target_chat_open(clicked_target_href):
+    rounds = max(8, timeout_ms // 500)
+    for _ in range(rounds):
+        if await is_target_chat_open():
             return True
         await page.wait_for_timeout(350)
-
-    if is_username_target:
-        # Explicit search attempts; avoid infinite "search input twitching".
-        for _ in range(3):
-            try:
-                pw_href = await _open_channel_via_playwright_search(page, target_username)
-                if pw_href:
-                    clicked_target_href = pw_href
-            except Exception:
-                pass
-            await page.wait_for_timeout(550)
-            if await is_target_chat_open(clicked_target_href):
-                return True
-    else:
-        # Numeric target fallback.
-        rounds = max(6, timeout_ms // 1200)
-        for _ in range(rounds):
-            if await is_target_chat_open(clicked_target_href):
-                return True
-            best_href = await page.evaluate(JS_FIND_BEST_CHAT_HREF, [target_key, target_username_norm])
-            if best_href:
-                try:
-                    await page.locator(f'a[href="{best_href}"]').first.click(timeout=1200)
-                    await page.wait_for_timeout(350)
-                    if await is_target_chat_open(best_href):
-                        return True
-                except Exception:
-                    pass
-            await page.wait_for_timeout(250)
-
     return False
 
 
@@ -365,156 +388,6 @@ async def _click_discussion_via_playwright(page: Page) -> bool:
     return False
 
 
-async def _get_active_chatlist_href(page: Page) -> str:
-    try:
-        href = await page.evaluate(
-            """() => {
-                const row = document.querySelector('a.chatlist-chat.active, .chatlist-chat.active');
-                return (row?.getAttribute?.('href') || '').trim();
-            }"""
-        )
-        return (href or "").strip()
-    except Exception:
-        return ""
-
-
-async def _open_channel_via_playwright_search(page: Page, target_username: str) -> str:
-    query = target_username.lstrip("@").strip()
-    if not query:
-        return ""
-
-    search_locators = [
-        ".sidebar-left .input-search-input",
-        ".chatlist-container .input-search-input",
-        ".sidebar-header .input-search-input",
-        ".input-search input[type='text']",
-    ]
-    search_input = None
-
-    for selector in search_locators:
-        locator = page.locator(selector)
-        try:
-            if await locator.count() > 0 and await locator.first.is_visible():
-                search_input = locator.first
-                break
-        except Exception:
-            continue
-
-    if search_input is None:
-        trigger = page.locator(".sidebar-header-search-trigger button, .sidebar-header .btn-icon")
-        try:
-            if await trigger.count() > 0:
-                await trigger.first.click(timeout=1200)
-                await page.wait_for_timeout(200)
-        except Exception:
-            pass
-        for selector in search_locators:
-            locator = page.locator(selector)
-            try:
-                if await locator.count() > 0 and await locator.first.is_visible():
-                    search_input = locator.first
-                    break
-            except Exception:
-                continue
-
-    if search_input is None:
-        return ""
-
-    try:
-        await search_input.click(timeout=1200)
-        await search_input.fill(query, timeout=2000)
-    except Exception:
-        return ""
-
-    await page.wait_for_timeout(500)
-
-    # DOM-level exact click in search results first; it handles nested clickable rows better.
-    try:
-        clicked_href = (
-            await page.evaluate(
-                JS_CLICK_SEARCH_RESULT_BY_USERNAME,
-                [query, re.sub(r"[^a-z0-9а-яё]+", "", query.lower())],
-            )
-            or ""
-        ).strip()
-        if clicked_href:
-            await page.wait_for_timeout(650)
-            href = await _get_active_chatlist_href(page)
-            return href or clicked_href
-    except Exception:
-        pass
-
-    # If search has focused result, Enter usually opens it.
-    try:
-        await search_input.press("Enter", timeout=900)
-        await page.wait_for_timeout(550)
-        href = await _get_active_chatlist_href(page)
-        if href:
-            return href
-    except Exception:
-        pass
-
-    row_selectors = [
-        "#column-left .chatlist a.chatlist-chat",
-        "#column-left .search-super-container a.chatlist-chat",
-        "#column-left .chatlist .chatlist-chat",
-        ".chatlist-container .chatlist a.chatlist-chat",
-    ]
-    query_lower = query.lower()
-    exact_username = f"@{query_lower}"
-
-    best_row = None
-    best_score = -1
-    for selector in row_selectors:
-        rows = page.locator(selector)
-        try:
-            count = min(await rows.count(), 30)
-        except Exception:
-            count = 0
-        for idx in range(count):
-            row = rows.nth(idx)
-            try:
-                if not await row.is_visible():
-                    continue
-                text = ((await row.inner_text()) or "").lower()
-                href_attr = ((await row.get_attribute("href")) or "").lower()
-                if query_lower not in text and query_lower not in href_attr:
-                    continue
-
-                usernames = set(re.findall(r"@[a-z0-9_]+", text))
-                score = 0
-                if exact_username in usernames:
-                    score += 300
-                elif any(name.startswith(exact_username) for name in usernames):
-                    score += 80
-                if exact_username in href_attr:
-                    score += 260
-                elif query_lower in href_attr:
-                    score += 60
-                if query_lower in text:
-                    score += 40
-                if any(name.endswith("_bot") for name in usernames) and exact_username not in usernames:
-                    score -= 120
-
-                if score > best_score:
-                    best_score = score
-                    best_row = row
-            except Exception:
-                continue
-
-    if best_row is not None and best_score >= 80:
-        try:
-            await best_row.click(timeout=1500, force=True)
-            await page.wait_for_timeout(600)
-            href = await _get_active_chatlist_href(page)
-            if href:
-                return href
-        except Exception:
-            pass
-
-    return ""
-
-
 async def _discussion_debug_snapshot(page: Page) -> str:
     try:
         payload = await page.evaluate(JS_DISCUSSION_DEBUG_SNAPSHOT)
@@ -559,15 +432,159 @@ async def _extract_visible_members(page: Page) -> list[dict[str, str]]:
         if not name:
             name = (item.get("raw_text") or "").strip()
         status = (item.get("status") or "").strip()
+        username = (item.get("username") or "").strip()
+        public_url = (item.get("public_url") or "").strip()
         members.append(
             {
                 "peer_id": peer_id,
                 "member_name": name,
                 "member_status": status,
                 "member_profile_url": f"https://web.telegram.org/k/#{peer_id}",
+                "member_username": username,
+                "member_public_url": public_url,
             }
         )
     return members
+
+
+async def _resolve_member_usernames_from_runtime(
+        page: Page,
+        members: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    unresolved_peer_ids = [
+        member["peer_id"]
+        for member in members
+        if member.get("peer_id") and not member.get("member_username")
+    ]
+    if not unresolved_peer_ids:
+        return members
+    try:
+        payload = await page.evaluate(JS_EXTRACT_USERNAMES_BY_PEER_IDS, unresolved_peer_ids)
+    except Exception:
+        return members
+    if not isinstance(payload, dict):
+        return members
+
+    enriched: list[dict[str, str]] = []
+    for member in members:
+        update = payload.get(member.get("peer_id", ""))
+        if isinstance(update, dict):
+            merged = dict(member)
+            merged["member_username"] = (update.get("username") or merged.get("member_username") or "").strip()
+            merged["member_public_url"] = (update.get("public_url") or merged.get("member_public_url") or "").strip()
+            enriched.append(merged)
+        else:
+            enriched.append(member)
+    return enriched
+
+
+async def _resolve_visible_member_username(page: Page, peer_id: str, profile_open_delay_ms: int) -> dict[str, str]:
+    try:
+        clicked = bool(await page.evaluate(JS_CLICK_VISIBLE_MEMBER_BY_PEER_ID, peer_id))
+        if not clicked:
+            return {"member_username": "", "member_public_url": ""}
+
+        await page.wait_for_timeout(max(250, profile_open_delay_ms))
+        payload = await page.evaluate(JS_EXTRACT_OPEN_USER_PROFILE_USERNAME)
+        username = (payload.get("username") if isinstance(payload, dict) else "") or ""
+        public_url = (payload.get("public_url") if isinstance(payload, dict) else "") or ""
+
+        closed = bool(await page.evaluate(JS_CLOSE_OPEN_USER_PROFILE))
+        if not closed:
+            await page.keyboard.press("Escape")
+        await page.wait_for_timeout(200)
+        await _ensure_members_tab(page)
+        return {"member_username": username.strip(), "member_public_url": public_url.strip()}
+    except Exception:
+        try:
+            await page.keyboard.press("Escape")
+            await _ensure_members_tab(page)
+        except Exception:
+            pass
+        return {"member_username": "", "member_public_url": ""}
+
+
+async def _resolve_visible_member_usernames(
+        page: Page,
+        members: list[dict[str, str]],
+        profile_open_delay_ms: int,
+) -> list[dict[str, str]]:
+    enriched: list[dict[str, str]] = []
+    for member in members:
+        peer_id = member.get("peer_id", "")
+        if not peer_id:
+            enriched.append(member)
+            continue
+        profile = await _resolve_visible_member_username(
+            page=page,
+            peer_id=peer_id,
+            profile_open_delay_ms=profile_open_delay_ms,
+        )
+        merged = dict(member)
+        merged.update(profile)
+        enriched.append(merged)
+    return enriched
+
+
+async def _resolve_member_username_by_peer_navigation(
+        page: Page,
+        peer_id: str,
+        timeout_ms: int,
+) -> dict[str, str]:
+    peer_id = (peer_id or "").strip()
+    if not peer_id:
+        return {"member_username": "", "member_public_url": ""}
+
+    navigation_url = urlunsplit(
+        ("https", "web.telegram.org", "/k/", f"agent_nav={time.time_ns()}", peer_id)
+    )
+    try:
+        await page.goto(navigation_url, wait_until="commit", timeout=min(max(2_000, timeout_ms), 12_000))
+    except Exception:
+        pass
+
+    deadline = time.monotonic() + max(1.0, timeout_ms / 1000)
+    while time.monotonic() < deadline:
+        username = _username_from_telegram_web_url(page.url)
+        if username:
+            return {"member_username": username, "member_public_url": f"https://t.me/{username}"}
+
+        try:
+            payload = await page.evaluate(JS_EXTRACT_OPEN_USER_PROFILE_USERNAME)
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            username = (payload.get("username") or "").strip()
+            public_url = (payload.get("public_url") or "").strip()
+            if username:
+                return {"member_username": username, "member_public_url": public_url or f"https://t.me/{username}"}
+
+        await page.wait_for_timeout(250)
+
+    return {"member_username": "", "member_public_url": ""}
+
+
+async def _resolve_member_usernames_by_peer_navigation(
+        page: Page,
+        members: list[dict[str, str]],
+        per_member_timeout_ms: int,
+) -> list[dict[str, str]]:
+    enriched: list[dict[str, str]] = []
+    for member in members:
+        if member.get("member_username") or not member.get("peer_id"):
+            enriched.append(member)
+            continue
+
+        profile = await _resolve_member_username_by_peer_navigation(
+            page=page,
+            peer_id=member["peer_id"],
+            timeout_ms=per_member_timeout_ms,
+        )
+        merged = dict(member)
+        if profile.get("member_username"):
+            merged.update(profile)
+        enriched.append(merged)
+    return enriched
 
 
 async def _wait_for_members_list(page: Page, timeout_ms: int = 8_000) -> bool:
@@ -587,9 +604,36 @@ async def _scroll_members_list(page: Page) -> bool:
 
 async def _scroll_active_chat_for_discussion(page: Page) -> bool:
     try:
-        return bool(
-            await page.evaluate(
-                """() => {
+        point = await page.evaluate(
+            """() => {
+                const chats = Array.from(document.querySelectorAll('.chat, .chat.tabs-tab'));
+                const isVisible = (chat) => {
+                    const rect = chat.getBoundingClientRect();
+                    const style = window.getComputedStyle(chat);
+                    return (
+                        rect.width > 260 &&
+                        rect.height > 260 &&
+                        style.display !== 'none' &&
+                        style.visibility !== 'hidden'
+                    );
+                };
+                const active = chats.find((chat) => chat.classList.contains('active') && isVisible(chat))
+                    || chats.find((chat) => isVisible(chat));
+                if (!active) return null;
+                const rect = active.getBoundingClientRect();
+                return {
+                    x: Math.floor(rect.left + rect.width / 2),
+                    y: Math.floor(rect.top + rect.height / 2),
+                };
+            }"""
+        )
+        if point:
+            await page.mouse.move(point["x"], point["y"])
+            await page.mouse.wheel(0, 900)
+            await page.wait_for_timeout(150)
+
+        moved = await page.evaluate(
+            """() => {
                     const chats = Array.from(document.querySelectorAll('.chat, .chat.tabs-tab'));
                     const isVisible = (chat) => {
                         const rect = chat.getBoundingClientRect();
@@ -616,8 +660,8 @@ async def _scroll_active_chat_for_discussion(page: Page) -> bool:
                     }
                     return false;
                 }"""
-            )
         )
+        return bool(point or moved)
     except Exception:
         return False
 
@@ -627,12 +671,31 @@ async def _collect_members(
         max_scrolls: int,
         stable_rounds: int,
         scroll_pause_ms: int,
+        resolve_usernames: bool,
+        resolve_usernames_by_opening_profiles: bool,
+        profile_open_delay_ms: int,
 ) -> list[dict[str, str]]:
     collected: dict[str, dict[str, str]] = {}
     stable = 0
 
     for _ in range(max_scrolls):
         visible = await _extract_visible_members(page)
+        if resolve_usernames and visible:
+            visible = await _resolve_member_usernames_from_runtime(page=page, members=visible)
+            unresolved = [member for member in visible if not member.get("member_username")]
+            if resolve_usernames_by_opening_profiles and unresolved:
+                resolved_by_click = await _resolve_visible_member_usernames(
+                    page=page,
+                    members=unresolved,
+                    profile_open_delay_ms=profile_open_delay_ms,
+                )
+                by_peer_id = {member["peer_id"]: member for member in resolved_by_click if member.get("peer_id")}
+                visible = [
+                    by_peer_id.get(member["peer_id"], member)
+                    if member.get("peer_id") in by_peer_id and by_peer_id[member["peer_id"]].get("member_username")
+                    else member
+                    for member in visible
+                ]
         if not visible and not collected:
             await page.wait_for_timeout(max(200, scroll_pause_ms))
             continue
@@ -641,8 +704,15 @@ async def _collect_members(
             peer_id = item["peer_id"]
             if peer_id not in collected:
                 collected[peer_id] = item
-            elif not collected[peer_id].get("member_name") and item.get("member_name"):
-                collected[peer_id] = item
+            else:
+                if not collected[peer_id].get("member_name") and item.get("member_name"):
+                    collected[peer_id]["member_name"] = item["member_name"]
+                if not collected[peer_id].get("member_username") and item.get("member_username"):
+                    collected[peer_id]["member_username"] = item["member_username"]
+                if not collected[peer_id].get("member_public_url") and item.get("member_public_url"):
+                    collected[peer_id]["member_public_url"] = item["member_public_url"]
+                if not collected[peer_id].get("member_status") and item.get("member_status"):
+                    collected[peer_id]["member_status"] = item["member_status"]
         after = len(collected)
 
         if after == before:
@@ -663,7 +733,8 @@ async def _collect_members(
 async def _try_open_discussion(page: Page, timeout_ms: int) -> tuple[bool, str]:
     attempts = 3
     for _ in range(attempts):
-        # Most reliable path in Telegram Web: click comments/discussion footer in a channel post.
+        # Telegram Web exposes linked discussion via post comments more consistently than via top-right menu:
+        # the menu may omit "View discussion" or open a post context menu instead.
         clicked = await _click_leave_comment(page)
         if not clicked:
             menu_opened = await _click_active_chat_menu(page)
@@ -683,10 +754,10 @@ async def _try_open_discussion(page: Page, timeout_ms: int) -> tuple[bool, str]:
             for _ in range(rounds):
                 await page.wait_for_timeout(250)
                 if await _is_group_chat_open(page):
-                    return True, page.url
+                    return True, _canonical_telegram_web_url(page.url)
                 if page.url != initial_url:
                     # Telegram often switches hash first and only then syncs header/sidebar.
-                    return True, page.url
+                    return True, _canonical_telegram_web_url(page.url)
 
         # If nothing clickable was found yet, scroll the active channel feed and retry.
         moved = await _scroll_active_chat_for_discussion(page)
@@ -739,6 +810,9 @@ async def process_channel(
         stable_rounds: int,
         scroll_pause_ms: int,
         auto_subscribe: bool,
+        resolve_usernames: bool,
+        resolve_usernames_by_opening_profiles: bool,
+        profile_open_delay_ms: int,
 ) -> list[dict[str, str]]:
     normalized = normalize_telegram_input_url(source_url)
     if not normalized:
@@ -750,6 +824,8 @@ async def process_channel(
                 "member_name": "",
                 "member_profile_url": "",
                 "peer_id": "",
+                "member_username": "",
+                "member_public_url": "",
                 "member_status": "",
                 "status": "invalid_url",
                 "error": "Unsupported Telegram URL format",
@@ -757,8 +833,7 @@ async def process_channel(
         ]
 
     try:
-        await page.goto(normalized, wait_until="domcontentloaded", timeout=timeout_ms)
-        await page.wait_for_timeout(1_200)
+        await _navigate_to_channel_url(page, normalized_url=normalized, timeout_ms=timeout_ms)
     except Exception as exc:
         return [
             {
@@ -768,6 +843,8 @@ async def process_channel(
                 "member_name": "",
                 "member_profile_url": "",
                 "peer_id": "",
+                "member_username": "",
+                "member_public_url": "",
                 "member_status": "",
                 "status": "navigation_error",
                 "error": str(exc),
@@ -778,18 +855,20 @@ async def process_channel(
         return [
             {
                 "source_channel_url": source_url,
-                "resolved_channel_url": page.url,
+                "resolved_channel_url": _canonical_telegram_web_url(page.url),
                 "discussion_url": "",
                 "member_name": "",
                 "member_profile_url": "",
                 "peer_id": "",
+                "member_username": "",
+                "member_public_url": "",
                 "member_status": "",
                 "status": "channel_not_opened",
                 "error": await _discussion_debug_snapshot(page),
             }
         ]
 
-    resolved_channel_url = page.url
+    resolved_channel_url = _canonical_telegram_web_url(page.url)
     await _stabilize_channel_view(page=page, source_url=normalized, timeout_ms=timeout_ms, max_reloads=2)
     if auto_subscribe and await _maybe_subscribe(page):
         await page.wait_for_timeout(800)
@@ -810,6 +889,8 @@ async def process_channel(
                 "member_name": "",
                 "member_profile_url": "",
                 "peer_id": "",
+                "member_username": "",
+                "member_public_url": "",
                 "member_status": "",
                 "status": "discussion_not_found",
                 "error": debug_info,
@@ -825,6 +906,8 @@ async def process_channel(
                 "member_name": "",
                 "member_profile_url": "",
                 "peer_id": "",
+                "member_username": "",
+                "member_public_url": "",
                 "member_status": "",
                 "status": "group_info_not_opened",
                 "error": "",
@@ -839,6 +922,9 @@ async def process_channel(
         max_scrolls=max_scrolls,
         stable_rounds=stable_rounds,
         scroll_pause_ms=scroll_pause_ms,
+        resolve_usernames=resolve_usernames,
+        resolve_usernames_by_opening_profiles=resolve_usernames_by_opening_profiles,
+        profile_open_delay_ms=profile_open_delay_ms,
     )
     if not members:
         debug_info = await _discussion_debug_snapshot(page)
@@ -850,6 +936,8 @@ async def process_channel(
                 "member_name": "",
                 "member_profile_url": "",
                 "peer_id": "",
+                "member_username": "",
+                "member_public_url": "",
                 "member_status": "",
                 "status": "members_not_found",
                 "error": debug_info,
@@ -866,6 +954,8 @@ async def process_channel(
                 "member_name": member.get("member_name", ""),
                 "member_profile_url": member.get("member_profile_url", ""),
                 "peer_id": member.get("peer_id", ""),
+                "member_username": member.get("member_username", ""),
+                "member_public_url": member.get("member_public_url", ""),
                 "member_status": member.get("member_status", ""),
                 "status": "ok",
                 "error": "",
@@ -938,6 +1028,28 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Разрешить скрипту нажимать SUBSCRIBE/JOIN перед поиском discussion.",
     )
+    parser.add_argument(
+        "--resolve-usernames",
+        action="store_true",
+        help=(
+            "Пытаться собрать публичный @username из DOM/runtime Telegram Web без открытия карточек. "
+            "Даёт стабильные t.me-ссылки там, где username виден Telegram Web."
+        ),
+    )
+    parser.add_argument(
+        "--resolve-usernames-by-opening-profiles",
+        action="store_true",
+        help=(
+            "Дополнительно открывать карточки участников, если username не найден быстрым способом. "
+            "Медленно и нестабильно; используйте вместе с увеличенным --channel-timeout-seconds."
+        ),
+    )
+    parser.add_argument(
+        "--profile-open-delay-ms",
+        type=int,
+        default=500,
+        help="Пауза после открытия карточки участника при --resolve-usernames-by-opening-profiles.",
+    )
     parser.add_argument("--timeout-seconds", type=int, default=35, help="Таймаут навигации, сек.")
     parser.add_argument("--limit", type=int, help="Ограничить количество ссылок из input-csv (с начала списка).")
     parser.add_argument("--max-scrolls", type=int, default=120, help="Максимум прокруток списка участников.")
@@ -971,6 +1083,8 @@ def write_output(path: Path, rows: list[dict[str, str]]) -> None:
         "member_name",
         "member_profile_url",
         "peer_id",
+        "member_username",
+        "member_public_url",
         "member_status",
         "status",
         "error",
@@ -1128,6 +1242,9 @@ async def run() -> int:
                         stable_rounds=max(1, args.stable_rounds),
                         scroll_pause_ms=max(100, args.scroll_pause_ms),
                         auto_subscribe=bool(args.auto_subscribe),
+                        resolve_usernames=bool(args.resolve_usernames),
+                        resolve_usernames_by_opening_profiles=bool(args.resolve_usernames_by_opening_profiles),
+                        profile_open_delay_ms=max(250, int(args.profile_open_delay_ms)),
                     ),
                     timeout=max(15, int(args.channel_timeout_seconds)),
                 )
@@ -1135,11 +1252,13 @@ async def run() -> int:
                 rows = [
                     {
                         "source_channel_url": source_url,
-                        "resolved_channel_url": page.url,
+                        "resolved_channel_url": _canonical_telegram_web_url(page.url),
                         "discussion_url": "",
                         "member_name": "",
                         "member_profile_url": "",
                         "peer_id": "",
+                        "member_username": "",
+                        "member_public_url": "",
                         "member_status": "",
                         "status": "channel_timeout",
                         "error": await _discussion_debug_snapshot(page),
@@ -1154,6 +1273,8 @@ async def run() -> int:
                         "member_name": "",
                         "member_profile_url": "",
                         "peer_id": "",
+                        "member_username": "",
+                        "member_public_url": "",
                         "member_status": "",
                         "status": "runtime_error",
                         "error": str(exc),
