@@ -22,7 +22,6 @@ from telegram_js import (
     JS_CLICK_DISCUSSION_ANYWHERE,
     JS_CLICK_DISCUSSION_MENU_ITEM,
     JS_CLICK_VISIBLE_MEMBER_BY_PEER_ID,
-    JS_CLOSE_OPEN_USER_PROFILE,
     JS_CLICK_LEAVE_COMMENT_OR_COMMENTS,
     JS_CLICK_SUBSCRIBE_OR_JOIN,
     JS_DISCUSSION_DEBUG_SNAPSHOT,
@@ -432,16 +431,22 @@ async def _extract_visible_members(page: Page) -> list[dict[str, str]]:
         if not name:
             name = (item.get("raw_text") or "").strip()
         status = (item.get("status") or "").strip()
+        role = (item.get("role") or "").strip()
+        is_admin = "yes" if item.get("is_admin") else ""
         username = (item.get("username") or "").strip()
         public_url = (item.get("public_url") or "").strip()
+        web_public_url = f"https://web.telegram.org/k/#@{username}" if username else ""
         members.append(
             {
                 "peer_id": peer_id,
                 "member_name": name,
                 "member_status": status,
+                "member_role": role,
+                "member_is_admin": is_admin,
                 "member_profile_url": f"https://web.telegram.org/k/#{peer_id}",
                 "member_username": username,
                 "member_public_url": public_url,
+                "member_web_public_url": web_public_url,
             }
         )
     return members
@@ -472,115 +477,165 @@ async def _resolve_member_usernames_from_runtime(
             merged = dict(member)
             merged["member_username"] = (update.get("username") or merged.get("member_username") or "").strip()
             merged["member_public_url"] = (update.get("public_url") or merged.get("member_public_url") or "").strip()
+            if merged["member_username"] and not merged.get("member_web_public_url"):
+                merged["member_web_public_url"] = f"https://web.telegram.org/k/#@{merged['member_username']}"
             enriched.append(merged)
         else:
             enriched.append(member)
     return enriched
 
 
-async def _resolve_visible_member_username(page: Page, peer_id: str, profile_open_delay_ms: int) -> dict[str, str]:
+async def _click_visible_member_and_read_username(
+        page: Page,
+        peer_id: str,
+        profile_open_delay_ms: int,
+) -> tuple[bool, dict[str, str]]:
     try:
         clicked = bool(await page.evaluate(JS_CLICK_VISIBLE_MEMBER_BY_PEER_ID, peer_id))
         if not clicked:
-            return {"member_username": "", "member_public_url": ""}
+            return False, {"member_username": "", "member_public_url": "", "member_web_public_url": ""}
 
-        await page.wait_for_timeout(max(250, profile_open_delay_ms))
+        deadline = time.monotonic() + max(3.0, max(250, profile_open_delay_ms) / 1000)
+        while time.monotonic() < deadline:
+            await page.wait_for_timeout(250)
+            username_from_url = _username_from_telegram_web_url(page.url)
+            if username_from_url:
+                return True, {
+                    "member_username": username_from_url,
+                    "member_public_url": f"https://t.me/{username_from_url}",
+                    "member_web_public_url": f"https://web.telegram.org/k/#@{username_from_url}",
+                }
+
         payload = await page.evaluate(JS_EXTRACT_OPEN_USER_PROFILE_USERNAME)
         username = (payload.get("username") if isinstance(payload, dict) else "") or ""
         public_url = (payload.get("public_url") if isinstance(payload, dict) else "") or ""
-
-        closed = bool(await page.evaluate(JS_CLOSE_OPEN_USER_PROFILE))
-        if not closed:
-            await page.keyboard.press("Escape")
-        await page.wait_for_timeout(200)
-        await _ensure_members_tab(page)
-        return {"member_username": username.strip(), "member_public_url": public_url.strip()}
+        username = username.strip()
+        return True, {
+            "member_username": username,
+            "member_public_url": public_url.strip(),
+            "member_web_public_url": f"https://web.telegram.org/k/#@{username}" if username else "",
+        }
     except Exception:
-        try:
-            await page.keyboard.press("Escape")
-            await _ensure_members_tab(page)
-        except Exception:
-            pass
-        return {"member_username": "", "member_public_url": ""}
+        return False, {"member_username": "", "member_public_url": "", "member_web_public_url": ""}
 
 
-async def _resolve_visible_member_usernames(
+async def _restore_discussion_members_view(
         page: Page,
-        members: list[dict[str, str]],
+        discussion_url: str,
+        timeout_ms: int,
+) -> bool:
+    try:
+        if await _wait_for_members_list(page, timeout_ms=1_500):
+            return True
+
+        target_key = _extract_hash_key(discussion_url)
+        current_key = _extract_hash_key(page.url)
+        if current_key and current_key != target_key:
+            try:
+                await page.go_back(wait_until="commit", timeout=min(timeout_ms, 8_000))
+                await page.wait_for_timeout(800)
+                if await _wait_for_members_list(page, timeout_ms=2_500):
+                    return True
+                if await _is_group_chat_open(page):
+                    if await _open_group_info(page):
+                        await _ensure_members_tab(page)
+                        if await _wait_for_members_list(page, timeout_ms=4_000):
+                            return True
+            except Exception:
+                pass
+
+        await _navigate_to_channel_url(page, normalized_url=discussion_url, timeout_ms=timeout_ms)
+        group_open = False
+        for _ in range(max(8, timeout_ms // 500)):
+            if await _is_group_chat_open(page):
+                group_open = True
+                break
+            await page.wait_for_timeout(500)
+        if not group_open:
+            return False
+
+        if not await _open_group_info(page):
+            return False
+        await _ensure_members_tab(page)
+        return await _wait_for_members_list(page, timeout_ms=max(4_000, timeout_ms // 2))
+    except Exception:
+        return False
+
+
+async def _resolve_one_member_username_by_discussion_click(
+        page: Page,
+        peer_id: str,
         profile_open_delay_ms: int,
-) -> list[dict[str, str]]:
-    enriched: list[dict[str, str]] = []
-    for member in members:
-        peer_id = member.get("peer_id", "")
-        if not peer_id:
-            enriched.append(member)
-            continue
-        profile = await _resolve_visible_member_username(
+        max_scrolls: int,
+        scroll_pause_ms: int,
+) -> dict[str, str]:
+    for _ in range(max(1, max_scrolls)):
+        clicked, profile = await _click_visible_member_and_read_username(
             page=page,
             peer_id=peer_id,
             profile_open_delay_ms=profile_open_delay_ms,
         )
-        merged = dict(member)
-        merged.update(profile)
-        enriched.append(merged)
-    return enriched
+        if clicked:
+            username = (profile.get("member_username") or "").strip()
+            public_url = (profile.get("member_public_url") or "").strip()
+            web_public_url = (profile.get("member_web_public_url") or "").strip()
+            if username and not public_url:
+                public_url = f"https://t.me/{username}"
+            if username and not web_public_url:
+                web_public_url = f"https://web.telegram.org/k/#@{username}"
+            return {
+                "member_username": username,
+                "member_public_url": public_url,
+                "member_web_public_url": web_public_url,
+            }
+
+        moved = await _scroll_members_list(page)
+        if not moved:
+            break
+        await page.wait_for_timeout(scroll_pause_ms)
+
+    return {"member_username": "", "member_public_url": "", "member_web_public_url": ""}
 
 
-async def _resolve_member_username_by_peer_navigation(
-        page: Page,
-        peer_id: str,
-        timeout_ms: int,
-) -> dict[str, str]:
-    peer_id = (peer_id or "").strip()
-    if not peer_id:
-        return {"member_username": "", "member_public_url": ""}
-
-    navigation_url = urlunsplit(
-        ("https", "web.telegram.org", "/k/", f"agent_nav={time.time_ns()}", peer_id)
-    )
-    try:
-        await page.goto(navigation_url, wait_until="commit", timeout=min(max(2_000, timeout_ms), 12_000))
-    except Exception:
-        pass
-
-    deadline = time.monotonic() + max(1.0, timeout_ms / 1000)
-    while time.monotonic() < deadline:
-        username = _username_from_telegram_web_url(page.url)
-        if username:
-            return {"member_username": username, "member_public_url": f"https://t.me/{username}"}
-
-        try:
-            payload = await page.evaluate(JS_EXTRACT_OPEN_USER_PROFILE_USERNAME)
-        except Exception:
-            payload = {}
-        if isinstance(payload, dict):
-            username = (payload.get("username") or "").strip()
-            public_url = (payload.get("public_url") or "").strip()
-            if username:
-                return {"member_username": username, "member_public_url": public_url or f"https://t.me/{username}"}
-
-        await page.wait_for_timeout(250)
-
-    return {"member_username": "", "member_public_url": ""}
-
-
-async def _resolve_member_usernames_by_peer_navigation(
+async def _resolve_member_usernames_by_discussion_click(
         page: Page,
         members: list[dict[str, str]],
-        per_member_timeout_ms: int,
+        discussion_url: str,
+        timeout_ms: int,
+        profile_open_delay_ms: int,
+        max_scrolls: int,
+        scroll_pause_ms: int,
 ) -> list[dict[str, str]]:
     enriched: list[dict[str, str]] = []
+    unresolved = [
+        member for member in members
+        if member.get("peer_id") and not member.get("member_username")
+    ]
+    if not unresolved:
+        return members
+
+    print(f"  resolving usernames by member clicks: {len(unresolved)}")
     for member in members:
         if member.get("member_username") or not member.get("peer_id"):
             enriched.append(member)
             continue
 
-        profile = await _resolve_member_username_by_peer_navigation(
+        merged = dict(member)
+        if not await _restore_discussion_members_view(
+                page=page,
+                discussion_url=discussion_url,
+                timeout_ms=timeout_ms,
+        ):
+            enriched.append(merged)
+            continue
+
+        profile = await _resolve_one_member_username_by_discussion_click(
             page=page,
             peer_id=member["peer_id"],
-            timeout_ms=per_member_timeout_ms,
+            profile_open_delay_ms=profile_open_delay_ms,
+            max_scrolls=max_scrolls,
+            scroll_pause_ms=scroll_pause_ms,
         )
-        merged = dict(member)
         if profile.get("member_username"):
             merged.update(profile)
         enriched.append(merged)
@@ -672,8 +727,6 @@ async def _collect_members(
         stable_rounds: int,
         scroll_pause_ms: int,
         resolve_usernames: bool,
-        resolve_usernames_by_opening_profiles: bool,
-        profile_open_delay_ms: int,
 ) -> list[dict[str, str]]:
     collected: dict[str, dict[str, str]] = {}
     stable = 0
@@ -682,20 +735,6 @@ async def _collect_members(
         visible = await _extract_visible_members(page)
         if resolve_usernames and visible:
             visible = await _resolve_member_usernames_from_runtime(page=page, members=visible)
-            unresolved = [member for member in visible if not member.get("member_username")]
-            if resolve_usernames_by_opening_profiles and unresolved:
-                resolved_by_click = await _resolve_visible_member_usernames(
-                    page=page,
-                    members=unresolved,
-                    profile_open_delay_ms=profile_open_delay_ms,
-                )
-                by_peer_id = {member["peer_id"]: member for member in resolved_by_click if member.get("peer_id")}
-                visible = [
-                    by_peer_id.get(member["peer_id"], member)
-                    if member.get("peer_id") in by_peer_id and by_peer_id[member["peer_id"]].get("member_username")
-                    else member
-                    for member in visible
-                ]
         if not visible and not collected:
             await page.wait_for_timeout(max(200, scroll_pause_ms))
             continue
@@ -711,8 +750,14 @@ async def _collect_members(
                     collected[peer_id]["member_username"] = item["member_username"]
                 if not collected[peer_id].get("member_public_url") and item.get("member_public_url"):
                     collected[peer_id]["member_public_url"] = item["member_public_url"]
+                if not collected[peer_id].get("member_web_public_url") and item.get("member_web_public_url"):
+                    collected[peer_id]["member_web_public_url"] = item["member_web_public_url"]
                 if not collected[peer_id].get("member_status") and item.get("member_status"):
                     collected[peer_id]["member_status"] = item["member_status"]
+                if not collected[peer_id].get("member_role") and item.get("member_role"):
+                    collected[peer_id]["member_role"] = item["member_role"]
+                if not collected[peer_id].get("member_is_admin") and item.get("member_is_admin"):
+                    collected[peer_id]["member_is_admin"] = item["member_is_admin"]
         after = len(collected)
 
         if after == before:
@@ -826,7 +871,10 @@ async def process_channel(
                 "peer_id": "",
                 "member_username": "",
                 "member_public_url": "",
+                "member_web_public_url": "",
                 "member_status": "",
+                "member_role": "",
+                "member_is_admin": "",
                 "status": "invalid_url",
                 "error": "Unsupported Telegram URL format",
             }
@@ -845,7 +893,10 @@ async def process_channel(
                 "peer_id": "",
                 "member_username": "",
                 "member_public_url": "",
+                "member_web_public_url": "",
                 "member_status": "",
+                "member_role": "",
+                "member_is_admin": "",
                 "status": "navigation_error",
                 "error": str(exc),
             }
@@ -862,7 +913,10 @@ async def process_channel(
                 "peer_id": "",
                 "member_username": "",
                 "member_public_url": "",
+                "member_web_public_url": "",
                 "member_status": "",
+                "member_role": "",
+                "member_is_admin": "",
                 "status": "channel_not_opened",
                 "error": await _discussion_debug_snapshot(page),
             }
@@ -891,7 +945,10 @@ async def process_channel(
                 "peer_id": "",
                 "member_username": "",
                 "member_public_url": "",
+                "member_web_public_url": "",
                 "member_status": "",
+                "member_role": "",
+                "member_is_admin": "",
                 "status": "discussion_not_found",
                 "error": debug_info,
             }
@@ -908,7 +965,10 @@ async def process_channel(
                 "peer_id": "",
                 "member_username": "",
                 "member_public_url": "",
+                "member_web_public_url": "",
                 "member_status": "",
+                "member_role": "",
+                "member_is_admin": "",
                 "status": "group_info_not_opened",
                 "error": "",
             }
@@ -923,8 +983,6 @@ async def process_channel(
         stable_rounds=stable_rounds,
         scroll_pause_ms=scroll_pause_ms,
         resolve_usernames=resolve_usernames,
-        resolve_usernames_by_opening_profiles=resolve_usernames_by_opening_profiles,
-        profile_open_delay_ms=profile_open_delay_ms,
     )
     if not members:
         debug_info = await _discussion_debug_snapshot(page)
@@ -938,11 +996,25 @@ async def process_channel(
                 "peer_id": "",
                 "member_username": "",
                 "member_public_url": "",
+                "member_web_public_url": "",
                 "member_status": "",
+                "member_role": "",
+                "member_is_admin": "",
                 "status": "members_not_found",
                 "error": debug_info,
             }
         ]
+
+    if resolve_usernames and resolve_usernames_by_opening_profiles:
+        members = await _resolve_member_usernames_by_discussion_click(
+            page=page,
+            members=members,
+            discussion_url=discussion_url,
+            timeout_ms=timeout_ms,
+            profile_open_delay_ms=profile_open_delay_ms,
+            max_scrolls=max_scrolls,
+            scroll_pause_ms=scroll_pause_ms,
+        )
 
     rows: list[dict[str, str]] = []
     for member in members:
@@ -956,7 +1028,10 @@ async def process_channel(
                 "peer_id": member.get("peer_id", ""),
                 "member_username": member.get("member_username", ""),
                 "member_public_url": member.get("member_public_url", ""),
+                "member_web_public_url": member.get("member_web_public_url", ""),
                 "member_status": member.get("member_status", ""),
+                "member_role": member.get("member_role", ""),
+                "member_is_admin": member.get("member_is_admin", ""),
                 "status": "ok",
                 "error": "",
             }
@@ -1040,8 +1115,9 @@ def parse_args() -> argparse.Namespace:
         "--resolve-usernames-by-opening-profiles",
         action="store_true",
         help=(
-            "Дополнительно открывать карточки участников, если username не найден быстрым способом. "
-            "Медленно и нестабильно; используйте вместе с увеличенным --channel-timeout-seconds."
+            "Дополнительно кликать участников из списка discussion members, если username не найден быстрым способом. "
+            "После клика скрипт берёт username из редиректа URL вида #@username. "
+            "Медленно; используйте вместе с увеличенным --channel-timeout-seconds."
         ),
     )
     parser.add_argument(
@@ -1085,14 +1161,30 @@ def write_output(path: Path, rows: list[dict[str, str]]) -> None:
         "peer_id",
         "member_username",
         "member_public_url",
+        "member_web_public_url",
         "member_status",
+        "member_role",
+        "member_is_admin",
         "status",
         "error",
     ]
+    normalized_rows: list[dict[str, str]] = []
+    for row in rows:
+        normalized = dict(row)
+        username = (normalized.get("member_username") or "").strip()
+        if username:
+            normalized.setdefault("member_public_url", "")
+            normalized.setdefault("member_web_public_url", "")
+            if not normalized["member_public_url"]:
+                normalized["member_public_url"] = f"https://t.me/{username}"
+            if not normalized["member_web_public_url"]:
+                normalized["member_web_public_url"] = f"https://web.telegram.org/k/#@{username}"
+        normalized_rows.append(normalized)
+
     with path.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(normalized_rows)
 
 
 async def run() -> int:
@@ -1259,7 +1351,10 @@ async def run() -> int:
                         "peer_id": "",
                         "member_username": "",
                         "member_public_url": "",
+                        "member_web_public_url": "",
                         "member_status": "",
+                        "member_role": "",
+                        "member_is_admin": "",
                         "status": "channel_timeout",
                         "error": await _discussion_debug_snapshot(page),
                     }
@@ -1275,7 +1370,10 @@ async def run() -> int:
                         "peer_id": "",
                         "member_username": "",
                         "member_public_url": "",
+                        "member_web_public_url": "",
                         "member_status": "",
+                        "member_role": "",
+                        "member_is_admin": "",
                         "status": "runtime_error",
                         "error": str(exc),
                     }

@@ -455,6 +455,8 @@ JS_SELECT_MEMBERS_TAB = """() => {
 # Extract visible members rows from sidebar list.
 # language=javascript
 JS_EXTRACT_VISIBLE_MEMBERS = """() => {
+    const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+    const rolePattern = /(admin|administrator|creator|owner|админ|администратор|создател|владелец)/i;
     const extractUsername = (value) => {
         const text = String(value || '');
         const linkMatch = text.match(/(?:https?:\\/\\/)?(?:t\\.me|telegram\\.me)\\/(@?[A-Za-z0-9_]{5,32})(?:[/?#]|$)/i);
@@ -464,6 +466,27 @@ JS_EXTRACT_VISIBLE_MEMBERS = """() => {
         const mentionMatch = text.match(/@([A-Za-z0-9_]{5,32})/);
         if (mentionMatch) return mentionMatch[1];
         return '';
+    };
+    const extractRole = (row, statusText, rawText) => {
+        const selectors = [
+            '.badge',
+            '.admin',
+            '.row-badge',
+            '.dialog-badge',
+            '.row-subtitle',
+            '.subtitle',
+            '.status',
+            '.user-status',
+            '.user-last-seen'
+        ].join(',');
+        const candidates = Array.from(row.querySelectorAll(selectors))
+            .map((node) => normalize(node.textContent))
+            .filter((text) => text && text.length <= 48 && rolePattern.test(text));
+        if (candidates.length) return candidates[0];
+        if (rolePattern.test(statusText || '')) return statusText;
+        const compactRaw = normalize(rawText);
+        const rawMatch = compactRaw.match(rolePattern);
+        return rawMatch ? rawMatch[0] : '';
     };
     const rows = Array.from(
         document.querySelectorAll(
@@ -483,19 +506,22 @@ JS_EXTRACT_VISIBLE_MEMBERS = """() => {
         ).trim();
         const nameNode = row.querySelector('.fullName, .peer-title, .user-title, .title, .full-name');
         const statusNode = row.querySelector('.subtitle, .status, .user-status, .user-last-seen');
-        const name = (nameNode?.textContent || '').replace(/\\s+/g, ' ').trim();
-        const status = (statusNode?.textContent || '').replace(/\\s+/g, ' ').trim();
-        const rawText = (row.textContent || '').replace(/\\s+/g, ' ').trim();
+        const name = normalize(nameNode?.textContent || '');
+        const status = normalize(statusNode?.textContent || '');
+        const rawText = normalize(row.textContent || '');
         const href = (
             row.getAttribute('href') ||
             row.querySelector('a[href]')?.getAttribute('href') ||
             ''
         ).trim();
         const username = extractUsername(`${href} ${rawText}`);
+        const role = extractRole(row, status, rawText);
         return {
             peer_id: peerId,
             name,
             status,
+            role,
+            is_admin: role ? rolePattern.test(role) : false,
             raw_text: rawText,
             href,
             username,
@@ -597,26 +623,24 @@ JS_SCROLL_MEMBERS_LIST = """() => {
 # language=javascript
 JS_CLICK_VISIBLE_MEMBER_BY_PEER_ID = """(peerId) => {
     const selector = [
+        '.sidebar.sidebar-right [data-peer-id]',
         '.sidebar.sidebar-right .search-super-container-members a.chatlist-chat-abitbigger',
         '.sidebar.sidebar-right .search-super-container-members .chatlist-chat-abitbigger',
         '.sidebar.sidebar-right .search-super-container-members .chatlist-chat',
-        '.sidebar.sidebar-right .search-super-container-members [data-peer-id]',
         '.sidebar.sidebar-right a.chatlist-chat-abitbigger[data-peer-id]',
         '.sidebar.sidebar-right .chatlist-chat-abitbigger[data-peer-id]',
         '.sidebar.sidebar-right .chatlist-chat[data-peer-id]'
     ].join(',');
     const rows = Array.from(document.querySelectorAll(selector));
-    const isVisible = (el) => {
-        const rect = el.getBoundingClientRect();
-        const style = window.getComputedStyle(el);
-        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-    };
+    const wanted = String(peerId || '').trim();
     const row = rows.find((el) => {
         const value = el.getAttribute('data-peer-id') || el.querySelector('[data-peer-id]')?.getAttribute('data-peer-id') || '';
-        return value.trim() === String(peerId || '').trim() && isVisible(el);
+        return value.trim() === wanted;
     });
     if (!row) return false;
-    row.click();
+    const target = row.closest('a.chatlist-chat, .chatlist-chat, .row-clickable, a, [role="button"]') || row;
+    target.scrollIntoView?.({block: 'center'});
+    target.click();
     return true;
 }"""
 
