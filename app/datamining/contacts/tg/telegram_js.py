@@ -128,9 +128,6 @@ JS_CLICK_ACTIVE_CHAT_MENU = """() => {
     return true;
 }"""
 
-# Backward-compatible alias requested by user ("like CLICK_ACTIVE_CHAT_MENU_JS").
-CLICK_ACTIVE_CHAT_MENU_JS = JS_CLICK_ACTIVE_CHAT_MENU
-
 # Click "View discussion" item in opened top-right menu.
 # language=javascript
 JS_CLICK_DISCUSSION_MENU_ITEM = """() => {
@@ -692,35 +689,6 @@ JS_EXTRACT_OPEN_USER_PROFILE_USERNAME = """() => {
         if (username) return { username, public_url: `https://t.me/${username}` };
     }
     return { username: '', public_url: '' };
-}"""
-
-# Return from an opened user profile back to the group info/members sidebar.
-# language=javascript
-JS_CLOSE_OPEN_USER_PROFILE = """() => {
-    const visible = (el) => {
-        if (!el) return false;
-        const rect = el.getBoundingClientRect();
-        const style = window.getComputedStyle(el);
-        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-    };
-    const candidates = Array.from(document.querySelectorAll(
-        '.sidebar.sidebar-right button, .sidebar.sidebar-right .btn-icon, .sidebar.sidebar-right [role="button"], .popup button, .popup [role="button"]'
-    ));
-    const backOrClose = candidates.find((el) => {
-        if (!visible(el)) return false;
-        const label = [
-            el.getAttribute('aria-label') || '',
-            el.getAttribute('title') || '',
-            el.className || '',
-            el.textContent || ''
-        ].join(' ').toLowerCase();
-        return /back|назад|close|закрыть|btn-menu-toggle|tgico-left|tgico-close/.test(label);
-    });
-    if (backOrClose) {
-        backOrClose.click();
-        return true;
-    }
-    return false;
 }"""
 
 # Login-state check for Telegram Web (auth screen markers absent + chat UI present).
