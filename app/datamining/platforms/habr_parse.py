@@ -7,14 +7,14 @@ from requests_futures.sessions import FuturesSession
 
 
 def fetch_raw_habr_pages_requests_futures(pages=10):
-    ''' Получить сырые данные с хабра '''
+    """Получить сырые данные с хабра"""
     session = FuturesSession(
         executor=ThreadPoolExecutor(max_workers=20),
         session=Session()
     )
     pages_habr = []
     for page_number in range(1, pages+1):
-        r = session.get('https://habr.com/all/page%d/' % page_number)
+        r = session.get('https://habr.com/ru/articles/page%d/' % page_number)
         pages_habr.append(r)
     pages_habr = [
         r.result().text for r in pages_habr
@@ -23,36 +23,39 @@ def fetch_raw_habr_pages_requests_futures(pages=10):
 
 
 def fetch_raw_habr_pages(pages=10):
-    ''' Получить сырые данные с хабра '''
+    """Получить сырые данные с хабра"""
     return fetch_raw_habr_pages_requests_futures(pages)
 
 
 def convert_habr_date_to_datetime(date_habr):
-    ''' Конвертер строковой даты с habr.com  в datetime '''
+    """Конвертер строковой даты с habr.com в datetime"""
     return dateparser.parse(date_habr)
 
 
 def get_titles_articles_with_raw_habr_pages(habr_pages):
-    ''' Распарсить сырые страницы: выбрать заголовки статей с датами
-        публикации '''
+    """Распарсить сырые страницы: выбрать заголовки статей с датами публикации"""
     titles_articles = []
     for page_text in habr_pages:
         soup = BeautifulSoup(page_text, "html.parser")
         # Ищем теги article с классом post - вот оно! статьи здесь
-        articles = soup.find_all("article", class_="post")
+        articles = soup.find_all("article", class_="tm-articles-list__item")
 
         for article in articles:
             # Ищем тег span с классом post__time - тут дата публикации
-            date_of_publication_tag = article.find("span", class_="post__time")
-            if not date_of_publication_tag:
+            date_of_publication_tag = article.find("time")  #, class_="post__time")
+            if not date_of_publication_tag or not 'datetime' in date_of_publication_tag.attrs:
                 continue
             # Конвертируем её в datetime
             date_of_publication = convert_habr_date_to_datetime(
-                date_of_publication_tag.get_text()
+                date_of_publication_tag['datetime']
             )
             # Ищем тег a с классом post__title_link - тут заголовок статьи
-            title_article_tag = article.find("a", class_="post__title_link")
+            title_article_tag = article.find("a", class_="tm-title__link")
             if not title_article_tag:
+                continue
+            # check if it is company
+            lnk = str(title_article_tag['href'])
+            if not lnk.startswith('/ru/companies'):
                 continue
 
             title_article = title_article_tag.get_text()
@@ -75,7 +78,7 @@ def get_weeks(date_begin, date_end):
 
 
 def divide_titles_at_weeks(titles_articles):
-    ''' Разделить заголовки по неделям '''
+    """Разделить заголовки по неделям"""
     if not titles_articles:
         return []
     # Берём даты публикаций самой старой и самой свежей статьи
