@@ -1097,6 +1097,7 @@ dependencies = [
     { name = "crawl4ai" },
     { name = "fastapi", extra = ["standard-no-fastapi-cloud-cli"] },
     { name = "itsdangerous" },
+    { name = "linkedin-scraper" },
     { name = "pdfplumber" },
     { name = "requests" },
     { name = "sqlalchemy" },
@@ -1112,10 +1113,28 @@ requires-dist = [
     { name = "crawl4ai", specifier = ">=0.8.6" },
     { name = "fastapi", extras = ["standard-no-fastapi-cloud-cli"], specifier = ">=0.135.2" },
     { name = "itsdangerous", specifier = ">=2.2.0" },
+    { name = "linkedin-scraper", specifier = ">=3.1.2" },
     { name = "pdfplumber", specifier = ">=0.11.8" },
     { name = "requests", specifier = ">=2.33.1" },
     { name = "sqlalchemy", specifier = ">=2.0.49" },
     { name = "xmltodict", specifier = ">=1.0.4" },
+]
+
+[[package]]
+name = "linkedin-scraper"
+version = "3.1.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiofiles" },
+    { name = "lxml" },
+    { name = "playwright" },
+    { name = "pydantic" },
+    { name = "python-dotenv" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/17/a9/5ab5bd7f38439def0e9ee919ccf1f6bc2e4b1fa8d782b2065a004b7c47c9/linkedin_scraper-3.1.2.tar.gz", hash = "sha256:194beb0f88c93879a5d760a37909fd3803e884a6a2ea9897e5500e84fd9322c1", size = 47518, upload-time = "2026-04-10T02:45:20.869Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ce/97/e7b2b846f7f4b33bde8a58c5e2a4ea34414b2d15b2d7742ea84bcde3800b/linkedin_scraper-3.1.2-py3-none-any.whl", hash = "sha256:4b73569f75b0828434f1ef56733e5594392028a0bc57ebcf3c8c267402584388", size = 53225, upload-time = "2026-04-10T02:45:18.83Z" },
 ]
 
 [[package]]

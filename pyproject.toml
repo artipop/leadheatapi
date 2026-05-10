@@ -12,6 +12,7 @@ dependencies = [
     "crawl4ai>=0.8.6",
     "fastapi[standard-no-fastapi-cloud-cli]>=0.135.2",
     "itsdangerous>=2.2.0", # required by `starlette.middleware.sessions`
+    "linkedin-scraper>=3.1.2",
     "pdfplumber>=0.11.8",
     "requests>=2.33.1",
     "sqlalchemy>=2.0.49",
