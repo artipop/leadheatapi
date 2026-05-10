@@ -245,8 +245,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "SMTP RCPT check (no message delivery): runs EHLO, MAIL FROM, RCPT TO, QUIT "
-            "for each email candidate and writes statuses."
-        )
+            "for each email candidate and writes statuses. Run this from a VPS/mail server "
+            "with outbound port 25 and a real HELO/Mail-From domain; home/office networks "
+            "are often blocked or distrusted by recipient MX servers."
+        ),
+        epilog=(
+            "Example: python3 app/datamining/contacts/smtp_rcpt_probe.py "
+            "--input output/generated_email_candidates_from_egrul_people_flat_extended.csv "
+            "--mail-from admin@example.com --helo-domain example.com --sleep-seconds 0.5 --shuffle"
+        ),
     )
     parser.add_argument(
         "--input",
