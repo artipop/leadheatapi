@@ -2,6 +2,7 @@
 
 Implementation follows the workflow from:
 https://vc.ru/dev/1730048-poluchaem-dannye-s-zakupkigovru-cherez-python-poshagovoe-rukovodstvo
+And also about certs https://ru.stackoverflow.com/q/1537599
 """
 
 import argparse
@@ -62,6 +63,7 @@ def _find_key_recursive(data: Any, key: str) -> str | None:
 
 
 def extract_archive_url(xml_text: str) -> str:
+    # TODO: or we can use `xml.etree.ElementTree` instead (depending on what is suitable for asyncio)
     payload = xmltodict.parse(xml_text)
     url_archive = payload['soap:Envelope']['soap:Body']['ns2:getDocsByOrgRegionResponse']['dataInfo'][
         'archiveUrl']
@@ -80,16 +82,29 @@ def request_archive_url(
         endpoint: str,
         xml_data: str,
         soap_timeout: int,
+        verify: str | None,
 ) -> str:
     headers = {"Content-Type": "text/xml; charset=utf-8"}
-    response = requests.post(endpoint, data=xml_data, headers=headers, timeout=soap_timeout)
+    response = requests.post(
+        endpoint,
+        data=xml_data,
+        headers=headers,
+        timeout=soap_timeout,
+        verify=verify,
+    )
     response.raise_for_status()
     return response.text
 
 
-def download_archive(url: str, token: str, output_path: Path, download_timeout: int) -> None:
+def download_archive(
+        url: str,
+        token: str,
+        output_path: Path,
+        download_timeout: int,
+        verify: str | None,
+) -> None:
     headers = {"individualPerson_token": token}
-    response = requests.get(url, headers=headers, timeout=download_timeout)
+    response = requests.get(url, headers=headers, timeout=download_timeout, verify=verify)
     response.raise_for_status()
     output_path.write_bytes(response.content)
 
@@ -146,6 +161,16 @@ def parse_args() -> argparse.Namespace:
         default=120,
         help="Archive download timeout in seconds. Default: 120.",
     )
+    parser.add_argument(
+        "--ca-bundle",
+        default=os.getenv("ZAKUPKI_CA_BUNDLE"),
+        help=(
+            "Path to custom PEM CA bundle. By default, certifi is extended with "
+            "Russian trusted CA certificates from scripts/russiantrustedca and "
+            "scripts/linux_russian_trusted_root_ca_pem. Can also be set via "
+            "ZAKUPKI_CA_BUNDLE."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -166,6 +191,7 @@ def main() -> int:
         endpoint=args.endpoint,
         xml_data=xml_data,
         soap_timeout=args.soap_timeout,
+        verify=args.ca_bundle,
     )
     response_path = Path(args.response_xml)
     response_path.write_text(soap_response, encoding="utf-8")
@@ -181,6 +207,7 @@ def main() -> int:
         token=args.token,
         output_path=output_path,
         download_timeout=args.download_timeout,
+        verify=args.ca_bundle,
     )
     print(f"Archive saved: {output_path}")
     return 0
