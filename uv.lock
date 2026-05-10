@@ -1098,6 +1098,7 @@ dependencies = [
     { name = "fastapi", extra = ["standard-no-fastapi-cloud-cli"] },
     { name = "itsdangerous" },
     { name = "pdfplumber" },
+    { name = "requests" },
     { name = "sqlalchemy" },
 ]
 
@@ -1111,6 +1112,7 @@ requires-dist = [
     { name = "fastapi", extras = ["standard-no-fastapi-cloud-cli"], specifier = ">=0.135.2" },
     { name = "itsdangerous", specifier = ">=2.2.0" },
     { name = "pdfplumber", specifier = ">=0.11.8" },
+    { name = "requests", specifier = ">=2.33.1" },
     { name = "sqlalchemy", specifier = ">=2.0.49" },
 ]
 
