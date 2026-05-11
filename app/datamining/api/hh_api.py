@@ -156,6 +156,7 @@ def fetch_vacancies_page(
     access_token: str,
     params: Optional[Mapping[str, Any]] = None,
     *,
+    professional_roles: Optional[Iterable[int]] = None,
     page: int = 0,
     per_page: int = 100,
     user_agent: Optional[str] = None,
@@ -168,9 +169,13 @@ def fetch_vacancies_page(
     if per_page < 1 or per_page > 100:
         raise ValueError("per_page must be between 1 and 100")
 
+    search_params: dict[str, Any] = dict(params or {})
+    if professional_roles is not None:
+        search_params["professional_roles"] = professional_roles
+
     query = [
         (key, value)
-        for key, value in _normalize_search_params(params)
+        for key, value in _normalize_search_params(search_params)
         if key not in {"page", "per_page"}
     ]
     query.extend(
@@ -194,6 +199,7 @@ def iter_vacancy_pages(
     access_token: str,
     params: Optional[Mapping[str, Any]] = None,
     *,
+    professional_roles: Optional[Iterable[int]] = None,
     per_page: int = 100,
     max_pages: Optional[int] = None,
     user_agent: Optional[str] = None,
@@ -209,6 +215,7 @@ def iter_vacancy_pages(
         payload = fetch_vacancies_page(
             access_token,
             params,
+            professional_roles=professional_roles,
             page=page,
             per_page=per_page,
             user_agent=user_agent,
@@ -231,6 +238,7 @@ def fetch_all_vacancies(
     access_token: str,
     params: Optional[Mapping[str, Any]] = None,
     *,
+    professional_roles: Optional[Iterable[int]] = None,
     per_page: int = 100,
     max_pages: Optional[int] = None,
     user_agent: Optional[str] = None,
@@ -242,6 +250,7 @@ def fetch_all_vacancies(
     for payload in iter_vacancy_pages(
         access_token,
         params,
+        professional_roles=professional_roles,
         per_page=per_page,
         max_pages=max_pages,
         user_agent=user_agent,
@@ -354,6 +363,7 @@ def collect_vacancy_texts(
     access_token: str,
     query: Optional[Mapping[str, Any]] = None,
     *,
+    professional_roles: Optional[Iterable[int]] = None,
     per_page: int = 100,
     max_pages: Optional[int] = None,
     user_agent: Optional[str] = None,
@@ -364,6 +374,7 @@ def collect_vacancy_texts(
     items = fetch_all_vacancies(
         access_token,
         query,
+        professional_roles=professional_roles,
         per_page=per_page,
         max_pages=max_pages,
         user_agent=user_agent,
@@ -389,6 +400,15 @@ def main():
     parser.add_argument("--client-secret", default=os.getenv("HH_CLIENT_SECRET"), help="HH application client_secret")
     parser.add_argument("--user-agent", default=os.getenv("HH_USER_AGENT"), help="HH-User-Agent value")
     parser.add_argument("--shell", action="store_true", help="Print shell export command instead of token only")
+    parser.add_argument(
+        "--professional-role",
+        "--professional-roles",
+        dest="professional_roles",
+        action="append",
+        type=int,
+        default=None,
+        help="HH professional_role filter. Repeat to pass several roles; omitted by default.",
+    )
     args = parser.parse_args()
 
     token = os.getenv("HH_ACCESS_TOKEN")
@@ -406,8 +426,8 @@ def main():
         {
             "text": "FPGA",
             "area": 1,
-            "professional_roles": [96, 156],
         },
+        professional_roles=args.professional_roles,
         per_page=50,
         max_pages=1,
     )

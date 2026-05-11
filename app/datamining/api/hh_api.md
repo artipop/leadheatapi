@@ -1,3 +1,7 @@
+## Общая инфа
+
+https://api.hh.ru/openapi/redoc
+
 ### Ключи
 
 OAuth
@@ -8,3 +12,6 @@ stomatologi
 
 pogromisty
 [96, 10]
+
+- https://api.hh.ru/professional_roles
+- https://api.hh.ru/suggests/professional_roles
