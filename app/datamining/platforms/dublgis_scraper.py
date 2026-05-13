@@ -1,7 +1,8 @@
 from html import unescape
+import json
 import re
 from typing import Optional
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
@@ -115,6 +116,103 @@ def get_firm_sites_by_url(firm_url: str) -> list[str]:
 def get_firm_sites(city_code: str, firm_id: str) -> list[str]:
     url = f"https://2gis.ru/{city_code}/firm/{firm_id}"
     return get_firm_sites_by_url(url)
+
+
+PHOTO_API_URL = "https://api.photo.2gis.com/2.0/photo/get"
+# Fallback key embedded in 2GIS frontend — extracted dynamically when possible.
+_PHOTO_API_KEY_FALLBACK = "gYu1s9N1wP"
+_PHOTO_API_KEY_RE = re.compile(r'"photoApiKey"\s*:\s*"([^"]+)"')
+_FIRM_ID_RE = re.compile(r"/firm/(\d+)")
+
+
+def _extract_photo_api_key(html: str) -> Optional[str]:
+    m = _PHOTO_API_KEY_RE.search(html)
+    return m.group(1) if m else None
+
+
+def _fetch_photos_from_api(
+    firm_id: str,
+    api_key: str,
+    page_size: int = 50,
+    max_photos: Optional[int] = None,
+) -> list[str]:
+    """Paginate through the 2GIS photo API and return direct photo URLs.
+
+    Stops when the API returns an empty page or fewer items than requested
+    (reliable last-page signal that doesn't rely on the 'total' field).
+    """
+    photos: list[str] = []
+    page = 1
+
+    while True:
+        fetch_size = page_size
+        if max_photos is not None:
+            remaining = max_photos - len(photos)
+            if remaining <= 0:
+                break
+            fetch_size = min(page_size, remaining)
+
+        params = urlencode({
+            "key": api_key,
+            "object_id": firm_id,
+            "object_type": "branch",
+            "locale": "ru",
+            "status": "active",
+            "sort_by": "position",
+            "album_code": "common",
+            "size": fetch_size,
+            "page": page,
+        })
+        req = Request(f"{PHOTO_API_URL}?{params}", headers={"User-Agent": USER_AGENT})
+        with urlopen(req, timeout=REQUEST_TIMEOUT) as response:
+            data = json.loads(response.read().decode("utf-8"))
+
+        albums = data.get("result", [])
+        if not albums:
+            break
+        items = albums[0].get("items", [])
+        if not items:
+            break
+
+        for item in items:
+            url = item.get("url")
+            if url:
+                photos.append(url)
+
+        if len(items) < fetch_size:
+            break  # fewer items than requested → last page
+        page += 1
+
+    return photos
+
+
+def get_firm_photos_by_url(
+    firm_url: str,
+    max_photos: Optional[int] = None,
+    max_retries: int = 3,
+) -> list[str]:
+    """Return all company photo URLs from the 2GIS photo API for a given firm page URL."""
+    m = _FIRM_ID_RE.search(firm_url)
+    if not m:
+        raise ValueError(f"Cannot extract firm ID from URL: {firm_url}")
+    firm_id = m.group(1)
+
+    # Fetch HTML to extract the embedded API key (fall back to known key on timeout).
+    api_key = _PHOTO_API_KEY_FALLBACK
+    for _ in range(max_retries):
+        try:
+            html = _fetch_html(firm_url)
+            api_key = _extract_photo_api_key(html) or _PHOTO_API_KEY_FALLBACK
+            break
+        except TimeoutError:
+            pass
+
+    return _fetch_photos_from_api(firm_id, api_key, max_photos=max_photos)
+
+
+def get_firm_photos(city_code: str, firm_id: str, **kwargs) -> list[str]:
+    url = f"https://2gis.ru/{city_code}/firm/{firm_id}"
+    return get_firm_photos_by_url(url, **kwargs)
 
 
 if __name__ == "__main__":
