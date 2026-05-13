@@ -49,6 +49,7 @@ FIRST_NAME_ALIASES: dict[str, tuple[str, ...]] = {
     "алена": ("alena", "alyona"),
     "андрей": ("andrey", "andrei"),
     "анна": ("anna",),
+    "анастасия": ("anastasia", "anastasiya", "anastasiia"),
     "антон": ("anton",),
     "артем": ("artem", "artyom"),
     "артём": ("artem", "artyom"),
