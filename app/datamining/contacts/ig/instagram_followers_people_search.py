@@ -1,13 +1,17 @@
 import argparse
 import asyncio
 import csv
+import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from typing import Mapping
 from typing import Sequence
+from typing import TypedDict
+from urllib.parse import urlsplit
 
 from playwright.async_api import Browser
 from playwright.async_api import BrowserContext
@@ -18,17 +22,35 @@ from playwright.async_api import async_playwright
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[4]))
 
-from app.datamining.contacts.ig.instagram_followers_name_search import (
-    _cleanup_stale_profile_locks,
-    _is_instagram_login_required,
-    _open_followers_dialog,
-    _search_name_in_followers,
-    _wait_for_instagram_login,
-    normalize_instagram_input_url,
-)
 from app.datamining.contacts.mail.email_generator import clean_name_token
 from app.datamining.contacts.mail.email_generator import name_variants
 
+INSTAGRAM_TECHNICAL_PATH_PREFIXES = {
+    "about",
+    "accounts",
+    "api",
+    "ar",
+    "blog",
+    "business",
+    "challenge",
+    "developer",
+    "direct",
+    "directory",
+    "explore",
+    "graphql",
+    "help",
+    "invites",
+    "legal",
+    "oauth",
+    "p",
+    "privacy",
+    "reel",
+    "reels",
+    "stories",
+    "terms",
+    "tv",
+    "web",
+}
 DETAIL_FIELDNAMES = (
     "source_instagram_url",
     "resolved_instagram_url",
@@ -52,6 +74,19 @@ SUMMARY_FIELDNAMES = (
     "matched_profiles",
     "queries_checked",
 )
+
+
+class InstagramFollowerRow(TypedDict):
+    source_instagram_url: str
+    resolved_instagram_url: str
+    searched_name: str
+    found_username: str
+    found_full_name: str
+    found_profile_url: str
+    matched_text: str
+    match_score: str
+    status: str
+    error: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +120,408 @@ def _normalize_text(value: str) -> str:
     text = (value or "").replace("ё", "е").replace("Ё", "Е").lower()
     text = re.sub(r"[^0-9a-zа-я._@]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _cleanup_stale_profile_locks(profile_dir: Path) -> None:
+    lock_names = ("SingletonLock", "SingletonSocket", "SingletonCookie")
+    lock_path = profile_dir / "SingletonLock"
+    should_cleanup = True
+
+    if lock_path.exists() or lock_path.is_symlink():
+        try:
+            target = os.readlink(lock_path)
+            pid_match = re.search(r"-(\d+)$", target)
+            if pid_match:
+                should_cleanup = not _pid_is_running(int(pid_match.group(1)))
+        except OSError:
+            should_cleanup = True
+
+    if not should_cleanup:
+        return
+
+    for name in lock_names:
+        path = profile_dir / name
+        try:
+            if path.is_symlink() or path.exists():
+                path.unlink()
+        except OSError:
+            pass
+
+
+def normalize_instagram_input_url(raw_url: str) -> str | None:
+    value = (raw_url or "").strip()
+    if not value:
+        return None
+    if "://" not in value:
+        value = f"https://{value}"
+
+    parsed = urlsplit(value)
+    host = (parsed.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host not in {"instagram.com", "instagr.am"}:
+        return None
+
+    parts = [part for part in (parsed.path or "").strip("/").split("/") if part]
+    if not parts:
+        return None
+    username = parts[0].strip().lstrip("@")
+    if username.lower() in INSTAGRAM_TECHNICAL_PATH_PREFIXES:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", username):
+        return None
+    return f"https://www.instagram.com/{username}/"
+
+
+def _username_from_profile_url(profile_url: str) -> str:
+    try:
+        parsed = urlsplit(profile_url)
+    except Exception:
+        return ""
+    parts = [part for part in (parsed.path or "").strip("/").split("/") if part]
+    if not parts:
+        return ""
+    username = parts[0].strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", username):
+        return ""
+    return username
+
+
+def _canonical_instagram_profile_url(url: str) -> str:
+    normalized = normalize_instagram_input_url(url)
+    return normalized or url
+
+
+def _name_tokens(value: str) -> list[str]:
+    normalized = _normalize_text(value)
+    return [token for token in normalized.split(" ") if token and token not in {"и", "the"}]
+
+
+def _match_score(target_name: str, candidate_text: str, username: str, full_name: str) -> int:
+    target_norm = _normalize_text(target_name)
+    if not target_norm:
+        return 0
+
+    username_norm = _normalize_text(username)
+    full_name_norm = _normalize_text(full_name)
+    text_norm = _normalize_text(candidate_text)
+    payload = " ".join(part for part in (username_norm, full_name_norm, text_norm) if part)
+
+    if target_norm in {username_norm, full_name_norm}:
+        return 100
+    if target_norm and target_norm in payload:
+        return 90
+
+    tokens = _name_tokens(target_name)
+    if len(tokens) >= 2 and all(token in payload for token in tokens):
+        return 80
+    if len(tokens) == 1 and tokens[0] in {username_norm, full_name_norm}:
+        return 70
+    if len(tokens) == 1 and tokens[0] in payload:
+        return 55
+    return 0
+
+
+async def _is_instagram_login_required(page: Page) -> bool:
+    try:
+        return bool(
+            await page.evaluate(
+                """() => {
+                    const url = location.href.toLowerCase();
+                    if (url.includes('/accounts/login')) return true;
+                    return !!document.querySelector(
+                        'input[name="username"], input[name="password"], form[action*="/accounts/login"]'
+                    );
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+async def _wait_for_instagram_login(page: Page, wait_seconds: int) -> bool:
+    deadline = time.monotonic() + max(10, wait_seconds)
+    while time.monotonic() < deadline:
+        if not await _is_instagram_login_required(page):
+            return True
+        await page.wait_for_timeout(2_000)
+    return not await _is_instagram_login_required(page)
+
+
+async def _wait_for_dialog(page: Page, timeout_ms: int) -> bool:
+    rounds = max(4, timeout_ms // 250)
+    for _ in range(rounds):
+        try:
+            if await page.locator('div[role="dialog"]').count():
+                return True
+        except Exception:
+            pass
+        await page.wait_for_timeout(250)
+    return False
+
+
+async def _open_followers_dialog(page: Page, profile_url: str, timeout_ms: int) -> tuple[bool, str]:
+    if await _wait_for_dialog(page, timeout_ms=1_000):
+        return True, ""
+
+    username = _username_from_profile_url(profile_url)
+    followers_url = f"https://www.instagram.com/{username}/followers/" if username else ""
+    selectors = [
+        f'a[href="/{username}/followers/"]' if username else "",
+        f'a[href$="/{username}/followers/"]' if username else "",
+        'a[href$="/followers/"]',
+        'a[href*="/followers/"]',
+    ]
+    text_selectors = [
+        'a:has-text("followers")',
+        'a:has-text("Followers")',
+        'a:has-text("подпис")',
+        'a:has-text("Подпис")',
+    ]
+
+    for selector in [item for item in [*selectors, *text_selectors] if item]:
+        try:
+            locator = page.locator(selector).first
+            if await locator.count():
+                await locator.click(timeout=min(timeout_ms, 6_000), force=True)
+                if await _wait_for_dialog(page, timeout_ms=min(timeout_ms, 10_000)):
+                    return True, ""
+        except Exception:
+            continue
+
+    try:
+        clicked = await page.evaluate(
+            """() => {
+                const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const candidates = Array.from(document.querySelectorAll('a, button, [role="link"], [role="button"]'));
+                const followersNode = candidates.find((node) => {
+                    const text = normalize(node.innerText || node.textContent || node.getAttribute('aria-label') || '');
+                    return text.includes('followers') || text.includes('подпис');
+                });
+                if (!followersNode) return false;
+                followersNode.click();
+                return true;
+            }"""
+        )
+        if clicked and await _wait_for_dialog(page, timeout_ms=min(timeout_ms, 10_000)):
+            return True, ""
+    except Exception:
+        pass
+
+    if followers_url:
+        try:
+            await page.goto(followers_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            if await _wait_for_dialog(page, timeout_ms=min(timeout_ms, 10_000)):
+                return True, ""
+        except Exception as exc:
+            return False, str(exc)
+
+    return False, "followers link/dialog not found"
+
+
+async def _find_followers_search_input(page: Page):
+    selectors = [
+        'div[role="dialog"] input[placeholder*="Search" i]',
+        'div[role="dialog"] input[placeholder*="Поиск" i]',
+        'div[role="dialog"] input[type="text"]',
+        'input[placeholder*="Search" i]',
+        'input[placeholder*="Поиск" i]',
+        'input[type="text"]',
+    ]
+    for selector in selectors:
+        locator = page.locator(selector).first
+        try:
+            if await locator.count() and await locator.is_visible(timeout=1_000):
+                return locator
+        except Exception:
+            continue
+    return None
+
+
+async def _clear_and_type_search(search_input: Any, query: str) -> None:
+    try:
+        await search_input.fill("")
+    except Exception:
+        await search_input.click(force=True)
+        await search_input.press("Meta+A")
+        await search_input.press("Backspace")
+    await search_input.fill(query)
+
+
+async def _extract_dialog_profiles(page: Page) -> list[dict[str, str]]:
+    payload = await page.evaluate(
+        """() => {
+            const technical = new Set([
+                'about', 'accounts', 'api', 'ar', 'blog', 'business', 'challenge', 'developer',
+                'direct', 'directory', 'explore', 'graphql', 'help', 'invites', 'legal', 'oauth', 'p',
+                'privacy', 'reel', 'reels', 'stories', 'terms', 'tv', 'web'
+            ]);
+            const dialog = document.querySelector('div[role="dialog"]') || document.body;
+            const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+            const result = [];
+            const seen = new Set();
+
+            for (const link of Array.from(dialog.querySelectorAll('a[href]'))) {
+                let url;
+                try {
+                    url = new URL(link.href, location.href);
+                } catch {
+                    continue;
+                }
+                let host = url.hostname.toLowerCase();
+                if (host.startsWith('www.')) host = host.slice(4);
+                if (host !== 'instagram.com') continue;
+
+                const parts = url.pathname.split('/').filter(Boolean);
+                if (parts.length !== 1) continue;
+                const username = (parts[0] || '').trim();
+                if (!/^[A-Za-z0-9._]{1,30}$/.test(username)) continue;
+                if (technical.has(username.toLowerCase())) continue;
+
+                let container = link;
+                for (let i = 0; i < 7; i += 1) {
+                    if (!container.parentElement) break;
+                    container = container.parentElement;
+                    const text = normalize(container.innerText || '');
+                    if (text && text.includes(username) && text.length > username.length) break;
+                }
+
+                const rowText = normalize(container.innerText || link.innerText || '');
+                const lines = rowText.split('\\n').map(normalize).filter(Boolean);
+                const fullName = lines.find((line) => line !== username && !/^follow|following|подпис/i.test(line)) || '';
+                const profileUrl = `https://www.instagram.com/${username}/`;
+                if (seen.has(profileUrl)) continue;
+                seen.add(profileUrl);
+                result.push({
+                    username,
+                    full_name: fullName,
+                    profile_url: profileUrl,
+                    row_text: rowText,
+                });
+            }
+            return result;
+        }"""
+    )
+    if not isinstance(payload, list):
+        return []
+    rows: list[dict[str, str]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "username": str(item.get("username") or "").strip(),
+                "full_name": str(item.get("full_name") or "").strip(),
+                "profile_url": _canonical_instagram_profile_url(str(item.get("profile_url") or "")),
+                "row_text": str(item.get("row_text") or "").strip(),
+            }
+        )
+    return rows
+
+
+async def _scroll_followers_dialog(page: Page) -> bool:
+    try:
+        return bool(
+            await page.evaluate(
+                """() => {
+                    const dialog = document.querySelector('div[role="dialog"]');
+                    if (!dialog) return false;
+                    const scrollers = Array.from(dialog.querySelectorAll('*'))
+                        .filter((el) => el.scrollHeight > el.clientHeight + 20)
+                        .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+                    const scroller = scrollers[0] || dialog;
+                    const previous = scroller.scrollTop;
+                    scroller.scrollTop = previous + Math.max(240, Math.floor(scroller.clientHeight * 0.85));
+                    return scroller.scrollTop !== previous;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+async def _search_name_in_followers(
+    page: Page,
+    source_url: str,
+    resolved_url: str,
+    target_name: str,
+    max_result_scrolls: int,
+    scroll_pause_ms: int,
+) -> list[InstagramFollowerRow]:
+    search_input = await _find_followers_search_input(page)
+    if search_input is None:
+        return [
+            {
+                "source_instagram_url": source_url,
+                "resolved_instagram_url": resolved_url,
+                "searched_name": target_name,
+                "found_username": "",
+                "found_full_name": "",
+                "found_profile_url": "",
+                "matched_text": "",
+                "match_score": "",
+                "status": "followers_search_not_found",
+                "error": "Search input was not found in followers dialog",
+            }
+        ]
+
+    await _clear_and_type_search(search_input, target_name)
+    await page.wait_for_timeout(1_200)
+
+    found: dict[str, InstagramFollowerRow] = {}
+    stable = 0
+    for _ in range(max(1, max_result_scrolls)):
+        profiles = await _extract_dialog_profiles(page)
+        before = len(found)
+        for profile in profiles:
+            score = _match_score(
+                target_name=target_name,
+                candidate_text=profile.get("row_text", ""),
+                username=profile.get("username", ""),
+                full_name=profile.get("full_name", ""),
+            )
+            if score <= 0:
+                continue
+            profile_url = profile.get("profile_url", "")
+            found[profile_url] = {
+                "source_instagram_url": source_url,
+                "resolved_instagram_url": resolved_url,
+                "searched_name": target_name,
+                "found_username": profile.get("username", ""),
+                "found_full_name": profile.get("full_name", ""),
+                "found_profile_url": profile_url,
+                "matched_text": profile.get("row_text", ""),
+                "match_score": str(score),
+                "status": "ok",
+                "error": "",
+            }
+        if len(found) == before:
+            stable += 1
+        else:
+            stable = 0
+        if stable >= 2:
+            break
+
+        moved = await _scroll_followers_dialog(page)
+        if not moved:
+            break
+        await page.wait_for_timeout(scroll_pause_ms)
+
+    try:
+        await search_input.fill("")
+    except Exception:
+        pass
+    return list(found.values())
 
 
 def _read_people_from_csv(path: Path, column: str) -> list[str]:
