@@ -1,11 +1,17 @@
-import csv
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from typing import TypedDict
 
 from bs4 import BeautifulSoup
 
+from app.datamining.contracts import SiteScrapeConfig
+from app.datamining.contracts import WriteRepository
+from app.datamining.sites.site_utils import build_browser_config
+from app.datamining.sites.site_utils import build_run_config
 from app.datamining.sites.site_utils import compact_spaces
+from app.datamining.sites.site_utils import crawl_site_pages
+from app.datamining.sites.site_utils import create_crawler
+from app.datamining.sites.site_utils import domain_slug
 from app.datamining.sites.site_utils import unique_values
 
 PHONE_RE = re.compile(r"(?:\+7|8)\s*\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}")
@@ -26,6 +32,53 @@ class ContactEntry:
     ogrnip: str
     phones: str
     emails: str
+
+
+class ContactRow(TypedDict):
+    domain: str
+    source_url: str
+    source_scope: str
+    inn: str
+    ogrn: str
+    ogrnip: str
+    phones: str
+    emails: str
+
+
+@dataclass(frozen=True, slots=True)
+class ContactsScraperConfig(SiteScrapeConfig):
+    pass
+
+
+class ContactsScraper:
+    def __init__(
+        self,
+        config: ContactsScraperConfig | None = None,
+        repository: WriteRepository[ContactRow] | None = None,
+    ) -> None:
+        self.config = config or ContactsScraperConfig()
+        self.repository = repository
+
+    async def scrape(self, site: str) -> list[ContactRow]:
+        pages = await crawl_pages(site, self.config)
+        items = contact_rows_from_pages(site, pages)
+        if self.repository:
+            self.repository.add_many(items)
+        return items
+
+
+async def crawl_pages(site: str, config: SiteScrapeConfig):
+    browser_config = build_browser_config()
+    run_config = build_run_config()
+    async with create_crawler(browser_config) as crawler:
+        return await crawl_site_pages(
+            crawler=crawler,
+            start_url=site,
+            max_pages=max(1, config.max_pages),
+            run_config=run_config,
+            verbose=config.verbose,
+            page_concurrency=max(1, config.page_concurrency),
+        )
 
 
 def normalize_phone(phone: str) -> str:
@@ -178,23 +231,18 @@ def extract_contacts(pages, domain: str) -> list[ContactEntry]:
     return entries
 
 
-def write_contacts_csv(path: Path, contacts) -> None:
-    with path.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=["domain", "source_url", "source_scope", "inn", "ogrn", "ogrnip", "phones", "emails"],
-        )
-        writer.writeheader()
-        for item in contacts:
-            writer.writerow(
-                {
-                    "domain": item.domain,
-                    "source_url": item.source_url,
-                    "source_scope": item.source_scope,
-                    "inn": item.inn,
-                    "ogrn": item.ogrn,
-                    "ogrnip": item.ogrnip,
-                    "phones": item.phones,
-                    "emails": item.emails,
-                }
-            )
+def contact_entry_to_row(item: ContactEntry) -> ContactRow:
+    return {
+        "domain": item.domain,
+        "source_url": item.source_url,
+        "source_scope": item.source_scope,
+        "inn": item.inn,
+        "ogrn": item.ogrn,
+        "ogrnip": item.ogrnip,
+        "phones": item.phones,
+        "emails": item.emails,
+    }
+
+
+def contact_rows_from_pages(site: str, pages) -> list[ContactRow]:
+    return [contact_entry_to_row(item) for item in extract_contacts(pages, domain_slug(site))]
