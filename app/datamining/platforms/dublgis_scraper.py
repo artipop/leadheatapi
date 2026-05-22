@@ -2,7 +2,8 @@ from html import unescape
 import json
 import re
 from typing import Optional
-from urllib.parse import urlencode, urlsplit
+from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
@@ -119,6 +120,10 @@ def get_firm_sites(city_code: str, firm_id: str) -> list[str]:
 
 
 PHOTO_API_URL = "https://api.photo.2gis.com/2.0/photo/get"
+# Matches full-size photo-gallery and legacy images/branch URLs served by 2GIS CDN.
+_PHOTO_URL_RE = re.compile(
+    r"https?://[a-z0-9]+\.photo\.2gis\.com/(?:photo-gallery|images/(?:branch|profile))/[^\s\"'<>]+"
+)
 # Fallback key embedded in 2GIS frontend — extracted dynamically when possible.
 _PHOTO_API_KEY_FALLBACK = "gYu1s9N1wP"
 _PHOTO_API_KEY_RE = re.compile(r'"photoApiKey"\s*:\s*"([^"]+)"')
@@ -190,14 +195,21 @@ def get_firm_photos_by_url(
     firm_url: str,
     max_photos: Optional[int] = None,
     max_retries: int = 3,
+    mode: str = "api",
 ) -> list[str]:
-    """Return all company photo URLs from the 2GIS photo API for a given firm page URL."""
+    """Return company photo URLs.
+
+    mode="api"        — 2GIS internal photo API (fast, no browser).
+    mode="playwright" — headless browser scroll on the /tab/photos page (no API key).
+    """
+    if mode == "playwright":
+        return _get_firm_photos_playwright(firm_url, max_photos=max_photos)
+
     m = _FIRM_ID_RE.search(firm_url)
     if not m:
         raise ValueError(f"Cannot extract firm ID from URL: {firm_url}")
     firm_id = m.group(1)
 
-    # Fetch HTML to extract the embedded API key (fall back to known key on timeout).
     api_key = _PHOTO_API_KEY_FALLBACK
     for _ in range(max_retries):
         try:
@@ -208,6 +220,93 @@ def get_firm_photos_by_url(
             pass
 
     return _fetch_photos_from_api(firm_id, api_key, max_photos=max_photos)
+
+
+def _get_firm_photos_playwright(
+    firm_url: str,
+    max_photos: Optional[int] = None,
+    headless: bool = False,
+    timeout_ms: int = 90_000,
+    **_kwargs,
+) -> list[str]:
+    """Load the 2GIS photo tab in a real browser, capture the API key that the
+    page's own JavaScript sends to api.photo.2gis.com, then fetch all photo
+    pages via our own HTTP requests with that key.
+
+    Defaults to headless=False so the browser fingerprint is indistinguishable
+    from a normal user session.  Pass headless=True for unattended use (may be
+    blocked by 2GIS anti-bot).
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "Playwright is not installed. Run: uv add playwright && uv run playwright install chromium"
+        ) from exc
+
+    from app.datamining.playwright_utils import cleanup_stale_profile_locks
+
+    m = _FIRM_ID_RE.search(firm_url)
+    if not m:
+        raise ValueError(f"Cannot extract firm ID from URL: {firm_url}")
+    firm_id = m.group(1)
+
+    base = firm_url.split("/tab/")[0]
+    photo_tab_url = f"{base}/tab/photos"
+
+    profile_dir = Path.home() / ".cache" / "leadheat" / "playwright-2gis"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_stale_profile_locks(profile_dir)
+
+    # Capture the API key from the first request the browser itself makes.
+    captured_key: list[str] = []
+
+    def _on_request(request) -> None:
+        if captured_key:
+            return
+        if "api.photo.2gis.com" not in request.url:
+            return
+        key = parse_qs(urlsplit(request.url).query).get("key", [None])[0]
+        if key:
+            captured_key.append(key)
+
+    with sync_playwright() as pw:
+        launch_kwargs: dict = dict(
+            user_data_dir=str(profile_dir),
+            headless=headless,
+            user_agent=USER_AGENT,
+            viewport={"width": 1440, "height": 900},
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        try:
+            context = pw.chromium.launch_persistent_context(channel="chrome", **launch_kwargs)
+        except Exception:
+            context = pw.chromium.launch_persistent_context(**launch_kwargs)
+
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        page.on("request", _on_request)
+        try:
+            try:
+                page.goto(photo_tab_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            except Exception:
+                pass  # timeout on slow pages — still try to collect
+            try:
+                page.wait_for_request(
+                    lambda r: "api.photo.2gis.com" in r.url,
+                    timeout=20_000,
+                )
+            except Exception:
+                pass
+            page.wait_for_timeout(1_000)
+        finally:
+            context.close()
+
+    if not captured_key:
+        return []
+    return _fetch_photos_from_api(firm_id, captured_key[0], max_photos=max_photos)
 
 
 def get_firm_photos(city_code: str, firm_id: str, **kwargs) -> list[str]:

@@ -2,78 +2,129 @@ import argparse
 import asyncio
 import csv
 import json
-import os
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.error import URLError
+from typing import Mapping
+from typing import Sequence
+from typing import TypedDict
 from urllib.parse import urlsplit, urlunsplit
-from urllib.request import urlopen
 
+import playwright.async_api
 from playwright.async_api import async_playwright, Page
 
-from telegram_js import (
-    JS_CHANNEL_RUNTIME_STATE,
-    JS_CLICK_ACTIVE_CHAT_MENU,
-    JS_CLICK_DISCUSSION_ANYWHERE,
-    JS_CLICK_DISCUSSION_MENU_ITEM,
-    JS_CLICK_VISIBLE_MEMBER_BY_PEER_ID,
-    JS_CLICK_LEAVE_COMMENT_OR_COMMENTS,
-    JS_CLICK_SUBSCRIBE_OR_JOIN,
-    JS_DISCUSSION_DEBUG_SNAPSHOT,
-    JS_EXTRACT_OPEN_USER_PROFILE_USERNAME,
-    JS_EXTRACT_USERNAMES_BY_PEER_IDS,
-    JS_EXTRACT_VISIBLE_MEMBERS,
-    JS_HAS_MEMBERS_LIST_ROWS,
-    JS_IS_ACTIVE_CHAT_OPEN,
-    JS_IS_GROUP_CHAT_OPEN,
-    JS_IS_GROUP_INFO_OPEN,
-    JS_IS_LOGGED_IN_TELEGRAM_WEB,
-    JS_OPEN_GROUP_INFO_BY_HEADER_CLICK,
-    JS_SCROLL_MEMBERS_LIST,
-    JS_SELECT_MEMBERS_TAB,
-)
+from app.datamining.playwright_utils import connect_async_over_cdp
+from app.datamining.playwright_utils import discover_ws_debugger_url
+from app.datamining.playwright_utils import launch_async_persistent_context
+from app.datamining.playwright_utils import wait_until_async
+
+try:
+    from .telegram_js import (
+        JS_CHANNEL_RUNTIME_STATE,
+        JS_CLICK_ACTIVE_CHAT_MENU,
+        JS_CLICK_DISCUSSION_ANYWHERE,
+        JS_CLICK_DISCUSSION_MENU_ITEM,
+        JS_CLICK_VISIBLE_MEMBER_BY_PEER_ID,
+        JS_CLICK_LEAVE_COMMENT_OR_COMMENTS,
+        JS_CLICK_SUBSCRIBE_OR_JOIN,
+        JS_DISCUSSION_DEBUG_SNAPSHOT,
+        JS_EXTRACT_OPEN_USER_PROFILE_USERNAME,
+        JS_EXTRACT_USERNAMES_BY_PEER_IDS,
+        JS_EXTRACT_VISIBLE_MEMBERS,
+        JS_HAS_MEMBERS_LIST_ROWS,
+        JS_IS_ACTIVE_CHAT_OPEN,
+        JS_IS_GROUP_CHAT_OPEN,
+        JS_IS_GROUP_INFO_OPEN,
+        JS_IS_LOGGED_IN_TELEGRAM_WEB,
+        JS_OPEN_GROUP_INFO_BY_HEADER_CLICK,
+        JS_SCROLL_MEMBERS_LIST,
+        JS_SELECT_MEMBERS_TAB,
+    )
+except ImportError:
+    from telegram_js import (
+        JS_CHANNEL_RUNTIME_STATE,
+        JS_CLICK_ACTIVE_CHAT_MENU,
+        JS_CLICK_DISCUSSION_ANYWHERE,
+        JS_CLICK_DISCUSSION_MENU_ITEM,
+        JS_CLICK_VISIBLE_MEMBER_BY_PEER_ID,
+        JS_CLICK_LEAVE_COMMENT_OR_COMMENTS,
+        JS_CLICK_SUBSCRIBE_OR_JOIN,
+        JS_DISCUSSION_DEBUG_SNAPSHOT,
+        JS_EXTRACT_OPEN_USER_PROFILE_USERNAME,
+        JS_EXTRACT_USERNAMES_BY_PEER_IDS,
+        JS_EXTRACT_VISIBLE_MEMBERS,
+        JS_HAS_MEMBERS_LIST_ROWS,
+        JS_IS_ACTIVE_CHAT_OPEN,
+        JS_IS_GROUP_CHAT_OPEN,
+        JS_IS_GROUP_INFO_OPEN,
+        JS_IS_LOGGED_IN_TELEGRAM_WEB,
+        JS_OPEN_GROUP_INFO_BY_HEADER_CLICK,
+        JS_SCROLL_MEMBERS_LIST,
+        JS_SELECT_MEMBERS_TAB,
+    )
 
 URL_COLUMN_CANDIDATES = ("telegram_url", "url", "channel_url", "telegram", "tg")
+TELEGRAM_MEMBER_FIELDNAMES = [
+    "source_channel_url",
+    "resolved_channel_url",
+    "discussion_url",
+    "member_name",
+    "member_profile_url",
+    "peer_id",
+    "member_username",
+    "member_public_url",
+    "member_web_public_url",
+    "member_status",
+    "member_role",
+    "member_is_admin",
+    "status",
+    "error",
+]
 
 
-def _pid_is_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+class TelegramMemberRow(TypedDict):
+    source_channel_url: str
+    resolved_channel_url: str
+    discussion_url: str
+    member_name: str
+    member_profile_url: str
+    peer_id: str
+    member_username: str
+    member_public_url: str
+    member_web_public_url: str
+    member_status: str
+    member_role: str
+    member_is_admin: str
+    status: str
+    error: str
 
 
-def _cleanup_stale_profile_locks(profile_dir: Path) -> None:
-    lock_names = ("SingletonLock", "SingletonSocket", "SingletonCookie")
-    lock_path = profile_dir / "SingletonLock"
-    should_cleanup = True
-
-    if lock_path.exists() or lock_path.is_symlink():
-        try:
-            target = os.readlink(lock_path)
-            pid_match = re.search(r"-(\d+)$", target)
-            if pid_match:
-                pid = int(pid_match.group(1))
-                should_cleanup = not _pid_is_running(pid)
-        except OSError:
-            should_cleanup = True
-
-    if not should_cleanup:
-        return
-
-    for name in lock_names:
-        path = profile_dir / name
-        try:
-            if path.is_symlink() or path.exists():
-                path.unlink()
-        except OSError:
-            pass
+@dataclass(frozen=True, slots=True)
+class TelegramMembersConfig:
+    channel_url: str = ""
+    input_csv: str | Path | None = None
+    output_csv: str | Path = "output/telegram_discussion_members.csv"
+    input_column: str = "telegram_url"
+    cdp_endpoint: str = "http://127.0.0.1:9222"
+    mode: str = "persistent"
+    user_data_dir: str = ".playwright/telegram-profile"
+    headless: bool = False
+    browser_channel: str = ""
+    login_wait_seconds: int = 120
+    no_login_prompt: bool = False
+    auto_subscribe: bool = False
+    resolve_usernames: bool = False
+    resolve_usernames_by_opening_profiles: bool = False
+    profile_open_delay_ms: int = 500
+    timeout_seconds: int = 35
+    limit: int | None = None
+    max_scrolls: int = 120
+    stable_rounds: int = 8
+    scroll_pause_ms: int = 300
+    channel_timeout_seconds: int = 90
 
 
 def normalize_telegram_input_url(raw_url: str) -> str | None:
@@ -808,43 +859,6 @@ async def _try_open_discussion(page: Page, timeout_ms: int) -> tuple[bool, str]:
     return False, ""
 
 
-def _discover_ws_debugger_url(cdp_endpoint: str, timeout_seconds: int = 5) -> str | None:
-    endpoint = (cdp_endpoint or "").strip().rstrip("/")
-    if not endpoint or not endpoint.startswith(("http://", "https://")):
-        return None
-
-    candidates = [
-        f"{endpoint}/json/version",
-        f"{endpoint}/json",
-    ]
-    for url in candidates:
-        try:
-            with urlopen(url, timeout=timeout_seconds) as response:
-                raw = response.read().decode("utf-8", errors="replace")
-        except (URLError, OSError):
-            continue
-
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-
-        if isinstance(payload, dict):
-            ws = payload.get("webSocketDebuggerUrl")
-            if isinstance(ws, str) and ws.startswith("ws://"):
-                return ws
-            continue
-
-        if isinstance(payload, list):
-            for item in payload:
-                if not isinstance(item, dict):
-                    continue
-                ws = item.get("webSocketDebuggerUrl")
-                if isinstance(ws, str) and ws.startswith("ws://"):
-                    return ws
-    return None
-
-
 async def process_channel(
         page: Page,
         source_url: str,
@@ -856,7 +870,7 @@ async def process_channel(
         resolve_usernames: bool,
         resolve_usernames_by_opening_profiles: bool,
         profile_open_delay_ms: int,
-) -> list[dict[str, str]]:
+) -> list[TelegramMemberRow]:
     normalized = normalize_telegram_input_url(source_url)
     if not normalized:
         return [
@@ -1014,7 +1028,7 @@ async def process_channel(
             scroll_pause_ms=scroll_pause_ms,
         )
 
-    rows: list[dict[str, str]] = []
+    rows: list[TelegramMemberRow] = []
     for member in members:
         rows.append(
             {
@@ -1148,25 +1162,61 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def write_output(path: Path, rows: list[dict[str, str]]) -> None:
+def config_from_args(args: argparse.Namespace) -> TelegramMembersConfig:
+    return TelegramMembersConfig(
+        input_csv=args.input_csv,
+        input_column=args.input_column,
+        output_csv=args.output_csv,
+        cdp_endpoint=args.cdp_endpoint,
+        mode=args.mode,
+        user_data_dir=args.user_data_dir,
+        headless=args.headless,
+        browser_channel=args.browser_channel,
+        login_wait_seconds=args.login_wait_seconds,
+        no_login_prompt=args.no_login_prompt,
+        auto_subscribe=args.auto_subscribe,
+        resolve_usernames=args.resolve_usernames,
+        resolve_usernames_by_opening_profiles=args.resolve_usernames_by_opening_profiles,
+        profile_open_delay_ms=args.profile_open_delay_ms,
+        timeout_seconds=args.timeout_seconds,
+        limit=args.limit,
+        max_scrolls=args.max_scrolls,
+        stable_rounds=args.stable_rounds,
+        scroll_pause_ms=args.scroll_pause_ms,
+        channel_timeout_seconds=args.channel_timeout_seconds,
+    )
+
+
+def write_output(path: Path, rows: Sequence[Mapping[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = [
-        "source_channel_url",
-        "resolved_channel_url",
-        "discussion_url",
-        "member_name",
-        "member_profile_url",
-        "peer_id",
-        "member_username",
-        "member_public_url",
-        "member_web_public_url",
-        "member_status",
-        "member_role",
-        "member_is_admin",
-        "status",
-        "error",
-    ]
-    normalized_rows: list[dict[str, str]] = []
+    normalized_rows = normalize_telegram_member_rows(rows)
+    with path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=TELEGRAM_MEMBER_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(normalized_rows)
+
+
+def telegram_member_row(row: Mapping[str, str]) -> TelegramMemberRow:
+    return {
+        "source_channel_url": row.get("source_channel_url", ""),
+        "resolved_channel_url": row.get("resolved_channel_url", ""),
+        "discussion_url": row.get("discussion_url", ""),
+        "member_name": row.get("member_name", ""),
+        "member_profile_url": row.get("member_profile_url", ""),
+        "peer_id": row.get("peer_id", ""),
+        "member_username": row.get("member_username", ""),
+        "member_public_url": row.get("member_public_url", ""),
+        "member_web_public_url": row.get("member_web_public_url", ""),
+        "member_status": row.get("member_status", ""),
+        "member_role": row.get("member_role", ""),
+        "member_is_admin": row.get("member_is_admin", ""),
+        "status": row.get("status", ""),
+        "error": row.get("error", ""),
+    }
+
+
+def normalize_telegram_member_rows(rows: Sequence[Mapping[str, str]]) -> list[TelegramMemberRow]:
+    normalized_rows: list[TelegramMemberRow] = []
     for row in rows:
         normalized = dict(row)
         username = (normalized.get("member_username") or "").strip()
@@ -1177,113 +1227,76 @@ def write_output(path: Path, rows: list[dict[str, str]]) -> None:
                 normalized["member_public_url"] = f"https://t.me/{username}"
             if not normalized["member_web_public_url"]:
                 normalized["member_web_public_url"] = f"https://web.telegram.org/k/#@{username}"
-        normalized_rows.append(normalized)
-
-    with path.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(normalized_rows)
+        normalized_rows.append(telegram_member_row(normalized))
+    return normalized_rows
 
 
-async def run() -> int:
-    args = parse_args()
-    input_path = Path(args.input_csv).expanduser().resolve()
-    output_path = Path(args.output_csv).expanduser().resolve()
-    if not input_path.exists():
-        print(f"Input CSV not found: {input_path}")
-        return 1
-
-    source_urls = read_channel_urls_from_csv(input_path, args.input_column)
+async def collect_telegram_member_rows(config: TelegramMembersConfig | None = None) -> list[TelegramMemberRow]:
+    config = config or config_from_args(parse_args())
+    if config.channel_url:
+        source_urls = [config.channel_url]
+    else:
+        if config.input_csv is None:
+            print("Set channel_url or input_csv.")
+            return []
+        input_path = Path(config.input_csv).expanduser().resolve()
+        if not input_path.exists():
+            print(f"Input CSV not found: {input_path}")
+            return []
+        source_urls = read_channel_urls_from_csv(input_path, config.input_column)
     if not source_urls:
         print("No Telegram URLs found in CSV.")
-        return 1
-    if args.limit is not None:
-        source_urls = source_urls[: max(0, int(args.limit))]
+        return []
+    if config.limit is not None:
+        source_urls = source_urls[: max(0, int(config.limit))]
         if not source_urls:
             print("No Telegram URLs left after applying --limit.")
-            return 1
+            return []
 
-    timeout_ms = max(5, args.timeout_seconds) * 1000
-    all_rows: list[dict[str, str]] = []
+    timeout_ms = max(5, config.timeout_seconds) * 1000
+    all_rows: list[TelegramMemberRow] = []
 
-    async with async_playwright() as playwright:
+    async with async_playwright() as pw:
         own_context = False
-        if args.mode == "persistent":
-            profile_dir = Path(args.user_data_dir).expanduser().resolve()
-            profile_dir.mkdir(parents=True, exist_ok=True)
-            _cleanup_stale_profile_locks(profile_dir)
-            launch_kwargs: dict[str, Any] = dict(
-                user_data_dir=str(profile_dir),
-                headless=bool(args.headless),
-                locale="ru-RU",
-                viewport={"width": 1440, "height": 900},
+        if config.mode == "persistent":
+            context, page, profile_dir, effective_channel = await launch_async_persistent_context(
+                pw,
+                config.user_data_dir,
+                headless=config.headless,
+                browser_channel=(config.browser_channel or "").strip(),
+                retry_system_chrome=True,
             )
-            channel = (args.browser_channel or "").strip()
-            effective_channel = channel
-            if channel:
-                launch_kwargs["channel"] = channel
-            try:
-                context = await playwright.chromium.launch_persistent_context(
-                    **launch_kwargs,
-                )
-            except Exception:
-                # CFT may crash on a previously used/corrupted profile; retry with a clean sibling profile.
-                if not channel:
-                    system_kwargs = dict(launch_kwargs)
-                    system_kwargs["channel"] = "chrome"
-                    try:
-                        print(f"Primary profile failed for CFT: {profile_dir}")
-                        print("Retrying with system Chrome channel...")
-                        context = await playwright.chromium.launch_persistent_context(**system_kwargs)
-                        effective_channel = "chrome"
-                    except Exception:
-                        fallback_dir = profile_dir.with_name(f"{profile_dir.name}-cft")
-                        fallback_dir.mkdir(parents=True, exist_ok=True)
-                        _cleanup_stale_profile_locks(fallback_dir)
-                        launch_kwargs["user_data_dir"] = str(fallback_dir)
-                        print(f"Retrying with fallback profile: {fallback_dir}")
-                        context = await playwright.chromium.launch_persistent_context(**launch_kwargs)
-                        profile_dir = fallback_dir
-                else:
-                    raise
             own_context = True
-            page: Page = context.pages[0] if context.pages else await context.new_page()
             print(f"Persistent profile: {profile_dir}")
             print(f"Persistent browser: {'chromium(cft)' if not effective_channel else effective_channel}")
         else:
-            browser = None
-            primary_error: Exception | None = None
-            try:
-                browser = await playwright.chromium.connect_over_cdp(args.cdp_endpoint, timeout=timeout_ms)
-            except TypeError:
-                try:
-                    browser = await playwright.chromium.connect_over_cdp(args.cdp_endpoint)
-                except Exception as exc:
-                    primary_error = exc
-            except Exception as exc:
-                primary_error = exc
+            browser: playwright.async_api.Browser
+            # for context in browser.contexts:
+            #     ...
+            # or
+            # browser.new_context()
+
+            browser, primary_error = await connect_async_over_cdp(pw, config.cdp_endpoint, timeout_ms)
 
             if browser is None:
-                ws_url = _discover_ws_debugger_url(args.cdp_endpoint)
+                ws_url = discover_ws_debugger_url(config.cdp_endpoint)
                 if ws_url:
-                    try:
-                        browser = await playwright.chromium.connect_over_cdp(ws_url, timeout=timeout_ms)
+                    browser, _ = await connect_async_over_cdp(pw, ws_url, timeout_ms)
+                    if browser is not None:
                         print(f"CDP fallback: connected via {ws_url}")
-                    except Exception:
-                        browser = None
 
             if browser is None:
-                print(f"Could not connect to Chrome CDP at {args.cdp_endpoint}: {primary_error}")
+                print(f"Could not connect to Chrome CDP at {config.cdp_endpoint}: {primary_error}")
                 print("Запустите отдельный Chrome с --remote-debugging-port=<port> и войдите в Telegram Web.")
                 print(
                     "Пример: open -na \"Google Chrome\" --args "
                     "--remote-debugging-port=9223 --user-data-dir=/tmp/chrome-cdp-9223"
                 )
-                return 1
+                return []
 
             if not browser.contexts:
                 print("Connected to CDP, but no browser contexts are available.")
-                return 1
+                return []
             context = browser.contexts[0]
             page: Page = context.pages[0] if context.pages else await context.new_page()
 
@@ -1293,26 +1306,21 @@ async def run() -> int:
         except Exception:
             pass
 
-        if args.mode == "persistent":
-            is_logged_in = bool(await page.evaluate(JS_IS_LOGGED_IN_TELEGRAM_WEB))
-            if not is_logged_in:
-                wait_seconds = max(10, int(args.login_wait_seconds))
+        if config.mode == "persistent":
+            async def is_logged_in() -> bool:
+                return bool(await page.evaluate(JS_IS_LOGGED_IN_TELEGRAM_WEB))
+
+            is_logged_in_now = await is_logged_in()
+            if not is_logged_in_now:
+                wait_seconds = max(10, int(config.login_wait_seconds))
                 print(f"Ожидание ручного логина в Telegram Web: до {wait_seconds} сек.")
-                deadline_ms = wait_seconds * 1000
-                elapsed = 0
-                while elapsed < deadline_ms:
-                    await page.wait_for_timeout(2000)
-                    elapsed += 2000
-                    is_logged_in = bool(await page.evaluate(JS_IS_LOGGED_IN_TELEGRAM_WEB))
-                    if is_logged_in:
-                        break
-                if not is_logged_in:
+                if not await wait_until_async(is_logged_in, wait_seconds, interval_ms=2_000):
                     print("Логин в Telegram не завершён. Завершите вход и запустите скрипт снова.")
                     if own_context and context is not None:
                         await context.close()
-                    return 1
+                    return []
 
-            if not bool(args.no_login_prompt):
+            if not bool(config.no_login_prompt):
                 print("Войдите в Telegram Web в открытом окне браузера.")
                 try:
                     input("После входа нажмите Enter, чтобы начать сбор: ")
@@ -1322,21 +1330,22 @@ async def run() -> int:
 
         for index, source_url in enumerate(source_urls, start=1):
             print(f"[{index}/{len(source_urls)}] {source_url}")
+            rows: list[TelegramMemberRow]
             try:
                 rows = await asyncio.wait_for(
                     process_channel(
                         page=page,
                         source_url=source_url,
                         timeout_ms=timeout_ms,
-                        max_scrolls=max(1, args.max_scrolls),
-                        stable_rounds=max(1, args.stable_rounds),
-                        scroll_pause_ms=max(100, args.scroll_pause_ms),
-                        auto_subscribe=bool(args.auto_subscribe),
-                        resolve_usernames=bool(args.resolve_usernames),
-                        resolve_usernames_by_opening_profiles=bool(args.resolve_usernames_by_opening_profiles),
-                        profile_open_delay_ms=max(250, int(args.profile_open_delay_ms)),
+                        max_scrolls=max(1, config.max_scrolls),
+                        stable_rounds=max(1, config.stable_rounds),
+                        scroll_pause_ms=max(100, config.scroll_pause_ms),
+                        auto_subscribe=bool(config.auto_subscribe),
+                        resolve_usernames=bool(config.resolve_usernames),
+                        resolve_usernames_by_opening_profiles=bool(config.resolve_usernames_by_opening_profiles),
+                        profile_open_delay_ms=max(250, int(config.profile_open_delay_ms)),
                     ),
-                    timeout=max(15, int(args.channel_timeout_seconds)),
+                    timeout=max(15, int(config.channel_timeout_seconds)),
                 )
             except asyncio.TimeoutError:
                 rows = [
@@ -1381,6 +1390,13 @@ async def run() -> int:
         if own_context and context is not None:
             await context.close()
 
+    return normalize_telegram_member_rows(all_rows)
+
+
+async def run(config: TelegramMembersConfig | None = None) -> int:
+    config = config or config_from_args(parse_args())
+    output_path = Path(config.output_csv).expanduser().resolve()
+    all_rows = await collect_telegram_member_rows(config)
     write_output(output_path, all_rows)
     print(f"Done. Saved: {output_path}")
     print(f"Rows: {len(all_rows)}")

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import argparse
 import json
 import re
@@ -20,10 +18,20 @@ SECTION_EXECUTIVE = (
 )
 SECTION_FOUNDERS = "Сведения об участниках / учредителях юридического лица"
 BTN_NAME_RE = re.compile("найти", re.IGNORECASE)
+EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.IGNORECASE)
+GRN_RE = re.compile(r"\bгрн\b.*?((?:\d[\s\u00A0]*){13})", re.IGNORECASE)
+EMAIL_SECTION_RE = re.compile(r"^\s*(?:\d+\s+)?Адрес электронной почты\b(.*)$", re.IGNORECASE)
 
 
 class EgrulScraperError(RuntimeError):
     """Raised when PDF parsing fails."""
+
+
+def normalize_inn(raw: str) -> str:
+    digits = "".join(ch for ch in str(raw) if ch.isdigit())
+    if len(digits) not in {10, 12}:
+        raise EgrulScraperError("INN must contain 10 or 12 digits.")
+    return digits
 
 
 def _normalize_text(text: str) -> str:
@@ -234,6 +242,70 @@ def _extract_legal_address(all_lines: list[str]) -> str:
     return ""
 
 
+def _extract_grn_from_line(line: str) -> str:
+    match = GRN_RE.search(line)
+    if not match:
+        return ""
+    return "".join(ch for ch in match.group(1) if ch.isdigit())
+
+
+def _extract_email_from_lines(lines: list[str]) -> str:
+    if not lines:
+        return ""
+
+    compact_text = "".join(_single_line(line) for line in lines)
+    spaced_text = _single_line(" ".join(lines))
+    for text in (compact_text, spaced_text):
+        match = EMAIL_RE.search(text)
+        if match:
+            return match.group(0).lower()
+    return ""
+
+
+def _extract_email_records(all_lines: list[str]) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    line_count = len(all_lines)
+
+    index = 0
+    while index < line_count:
+        line = all_lines[index]
+        heading_match = EMAIL_SECTION_RE.match(line)
+        if heading_match is None:
+            index += 1
+            continue
+
+        heading_remainder = heading_match.group(1).strip()
+        email_lines: list[str] = [heading_remainder] if heading_remainder else []
+        grn = ""
+        step = index + 1
+        while step < line_count and step <= index + 12:
+            probe_line = all_lines[step]
+            probe_norm = _normalize_text(probe_line)
+            if EMAIL_SECTION_RE.match(probe_line):
+                break
+            if _is_section_heading_text(probe_norm):
+                break
+
+            if "грн" in probe_norm:
+                grn = _extract_grn_from_line(probe_line)
+                break
+
+            email_lines.append(probe_line)
+            step += 1
+
+        email = _extract_email_from_lines(email_lines)
+        if email:
+            key = (email, grn)
+            if key not in seen:
+                seen.add(key)
+                records.append({"email": email, "grn": grn})
+
+        index = max(index + 1, step)
+
+    return records
+
+
 def parse_only_filtered_from_pdf(pdf_path: Path) -> dict[str, list[str]]:
     if not pdf_path.exists():
         raise EgrulScraperError(f"PDF file does not exist: {pdf_path}")
@@ -320,6 +392,43 @@ def parse_only_filtered_from_pdf(pdf_path: Path) -> dict[str, list[str]]:
     return section_fio
 
 
+def parse_egrul_pdf(pdf_path: Path, inn: str = "", result_title: str = "") -> dict[str, object]:
+    all_lines = _extract_lines_from_pdf(pdf_path)
+    sections = parse_only_filtered_from_pdf(pdf_path)
+    legal_address = _extract_legal_address(all_lines)
+    emails = _extract_email_records(all_lines)
+    return {
+        "inn": inn,
+        "result_title": result_title or pdf_path.stem,
+        "pdf_path": str(pdf_path.resolve()),
+        "legal_address": legal_address,
+        "emails": emails,
+        "sections": sections,
+    }
+
+
+def extract_egrul_by_inn(
+    inn: str,
+    out_dir: Path,
+    timeout_seconds: int = 60,
+    download_timeout_seconds: int = 120,
+    headless: bool = True,
+) -> dict[str, object]:
+    normalized_inn = normalize_inn(inn)
+    pdf_path, result_title = download_extract_pdf_by_inn(
+        inn=normalized_inn,
+        out_dir=out_dir,
+        timeout_seconds=timeout_seconds,
+        download_timeout_seconds=download_timeout_seconds,
+        headless=headless,
+    )
+    return parse_egrul_pdf(
+        pdf_path=pdf_path,
+        inn=normalized_inn,
+        result_title=result_title,
+    )
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -355,32 +464,21 @@ def main() -> int:
         return 1
 
     try:
-        result_title = ""
         if args.pdf_path:
             pdf_path = Path(args.pdf_path)
-            result_title = pdf_path.stem
+            payload = parse_egrul_pdf(pdf_path=pdf_path, inn=args.inn or "")
         else:
-            pdf_path, result_title = download_extract_pdf_by_inn(
+            payload = extract_egrul_by_inn(
                 inn=args.inn,
                 out_dir=Path(args.out_dir),
                 timeout_seconds=args.timeout,
                 download_timeout_seconds=args.download_timeout,
                 headless=not args.headful,
             )
-        all_lines = _extract_lines_from_pdf(pdf_path)
-        sections = parse_only_filtered_from_pdf(pdf_path)
-        legal_address = _extract_legal_address(all_lines)
     except EgrulScraperError as exc:
         print(f"Error: {exc}")
         return 1
 
-    payload = {
-        "inn": args.inn or "",
-        "result_title": result_title,
-        "pdf_path": str(pdf_path.resolve()),
-        "legal_address": legal_address,
-        "sections": sections,
-    }
     if args.json_out:
         output_path = Path(args.json_out)
         output_path.parent.mkdir(parents=True, exist_ok=True)

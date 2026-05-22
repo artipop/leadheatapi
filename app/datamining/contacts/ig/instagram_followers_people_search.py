@@ -1,10 +1,7 @@
 import argparse
 import asyncio
 import csv
-import os
 import re
-import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,11 +16,11 @@ from playwright.async_api import Page
 from playwright.async_api import Playwright
 from playwright.async_api import async_playwright
 
-if __package__ in {None, ""}:
-    sys.path.append(str(Path(__file__).resolve().parents[4]))
-
 from app.datamining.contacts.mail.email_generator import clean_name_token
 from app.datamining.contacts.mail.email_generator import name_variants
+from app.datamining.playwright_utils import connect_async_over_cdp
+from app.datamining.playwright_utils import launch_async_persistent_context
+from app.datamining.playwright_utils import wait_for_manual_login
 
 INSTAGRAM_TECHNICAL_PATH_PREFIXES = {
     "about",
@@ -122,42 +119,6 @@ def _normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _pid_is_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-
-def _cleanup_stale_profile_locks(profile_dir: Path) -> None:
-    lock_names = ("SingletonLock", "SingletonSocket", "SingletonCookie")
-    lock_path = profile_dir / "SingletonLock"
-    should_cleanup = True
-
-    if lock_path.exists() or lock_path.is_symlink():
-        try:
-            target = os.readlink(lock_path)
-            pid_match = re.search(r"-(\d+)$", target)
-            if pid_match:
-                should_cleanup = not _pid_is_running(int(pid_match.group(1)))
-        except OSError:
-            should_cleanup = True
-
-    if not should_cleanup:
-        return
-
-    for name in lock_names:
-        path = profile_dir / name
-        try:
-            if path.is_symlink() or path.exists():
-                path.unlink()
-        except OSError:
-            pass
-
-
 def normalize_instagram_input_url(raw_url: str) -> str | None:
     value = (raw_url or "").strip()
     if not value:
@@ -247,15 +208,6 @@ async def _is_instagram_login_required(page: Page) -> bool:
         )
     except Exception:
         return False
-
-
-async def _wait_for_instagram_login(page: Page, wait_seconds: int) -> bool:
-    deadline = time.monotonic() + max(10, wait_seconds)
-    while time.monotonic() < deadline:
-        if not await _is_instagram_login_required(page):
-            return True
-        await page.wait_for_timeout(2_000)
-    return not await _is_instagram_login_required(page)
 
 
 async def _wait_for_dialog(page: Page, timeout_ms: int) -> bool:
@@ -655,29 +607,23 @@ def confidence_for_match(
 
 
 async def _create_persistent_context(config: InstagramPeopleSearchConfig) -> tuple[Playwright, BrowserContext, Page, None]:
-    profile_dir = Path(config.user_data_dir).expanduser().resolve()
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    _cleanup_stale_profile_locks(profile_dir)
-
-    launch_kwargs: dict[str, Any] = {
-        "user_data_dir": str(profile_dir),
-        "headless": bool(config.headless),
-        "locale": "ru-RU",
-        "viewport": {"width": 1440, "height": 900},
-    }
-    if config.browser_channel:
-        launch_kwargs["channel"] = config.browser_channel
-
     playwright = await async_playwright().start()
-    context = await playwright.chromium.launch_persistent_context(**launch_kwargs)
-    page = context.pages[0] if context.pages else await context.new_page()
+    context, page, profile_dir, _ = await launch_async_persistent_context(
+        playwright,
+        config.user_data_dir,
+        headless=config.headless,
+        browser_channel=config.browser_channel,
+    )
     print(f"Instagram profile: {profile_dir}")
     return playwright, context, page, None
 
 
 async def _connect_over_cdp(config: InstagramPeopleSearchConfig) -> tuple[Playwright, BrowserContext, Page, Browser]:
     playwright = await async_playwright().start()
-    browser = await playwright.chromium.connect_over_cdp(config.cdp_endpoint)
+    timeout_ms = max(5, config.timeout_seconds) * 1000
+    browser, error = await connect_async_over_cdp(playwright, config.cdp_endpoint, timeout_ms)
+    if browser is None:
+        raise error or RuntimeError(f"Could not connect to Chrome CDP at {config.cdp_endpoint}")
     context = browser.contexts[0] if browser.contexts else await browser.new_context()
     normalized_profile_url = normalize_instagram_input_url(config.profile_url) or config.profile_url
     page = next((item for item in context.pages if item.url.rstrip("/") == normalized_profile_url.rstrip("/")), None)
@@ -705,7 +651,7 @@ async def _ensure_login(page: Page, config: InstagramPeopleSearchConfig, timeout
     if await _is_instagram_login_required(page):
         wait_seconds = max(10, int(config.login_wait_seconds))
         print(f"Ожидание ручного логина в Instagram: до {wait_seconds} сек.")
-        if not await _wait_for_instagram_login(page, wait_seconds=wait_seconds):
+        if not await wait_for_manual_login(page, _is_instagram_login_required, wait_seconds=wait_seconds):
             raise SystemExit("Логин в Instagram не завершён. Завершите вход и запустите скрипт снова.")
 
     if not config.no_login_prompt:

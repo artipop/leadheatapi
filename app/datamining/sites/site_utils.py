@@ -1,14 +1,14 @@
-import argparse
 import os
 import re
 from collections import deque
 from collections.abc import AsyncIterable
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urldefrag, unquote, urljoin, urlparse
 
 from bs4 import BeautifulSoup
+
+from app.datamining.contracts import PageData
 
 os.environ.setdefault("CRAWL4_AI_BASE_DIRECTORY", str(Path(__file__).resolve().parents[2]))
 
@@ -63,6 +63,25 @@ SKIP_EXTENSIONS = {
 }
 MULTI_PART_TLDS = {"co", "com", "org", "net", "gov", "edu"}
 CRAWL_PRIORITY_HINTS = (
+    "contact",
+    "contacts",
+    "kontakty",
+    "kontakti",
+    "kontakt",
+    "requisite",
+    "requisites",
+    "rekvizity",
+    "rekvizit",
+    "legal",
+    "about",
+    "o-kompanii",
+    "company",
+    "контакт",
+    "контакты",
+    "реквизит",
+    "реквизиты",
+    "юрид",
+    "о компании",
     "price",
     "pricing",
     "prices",
@@ -101,14 +120,6 @@ CRAWL_PRIORITY_HINTS = (
     "онлайн запис",
     "запис",
 )
-
-
-@dataclass(frozen=True, slots=True)
-class PageData:
-    url: str
-    title: str
-    html: str
-    markdown: str
 
 
 def compact_spaces(text: str) -> str:
@@ -524,10 +535,10 @@ async def crawl_site_pages(
     return pages
 
 
-def load_urls(args: argparse.Namespace) -> list[str]:
-    urls = [value for value in (args.url or []) if value.strip()]
-    if args.url_file:
-        for line in Path(args.url_file).read_text(encoding="utf-8").splitlines():
+def load_urls(raw_urls: list[str] | None = None, url_file: str | None = None) -> list[str]:
+    urls = [value for value in (raw_urls or []) if value.strip()]
+    if url_file:
+        for line in Path(url_file).read_text(encoding="utf-8").splitlines():
             value = line.strip()
             if not value or value.startswith("#"):
                 continue

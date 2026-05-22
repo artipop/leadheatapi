@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import argparse
 import json
 import re
@@ -54,6 +52,13 @@ def _to_number(raw: Optional[str]) -> Optional[float]:
         return float(cleaned)
     except ValueError:
         return None
+
+
+def normalize_inn(raw: str) -> str:
+    digits = "".join(ch for ch in str(raw) if ch.isdigit())
+    if len(digits) not in {10, 12}:
+        raise BoNalogScraperError("INN must contain 10 or 12 digits.")
+    return digits
 
 
 def _extract_org_id(url: str) -> Optional[str]:
@@ -568,6 +573,27 @@ def scrape_revenue(
     return rendered_result if rendered_result.value_raw is not None else result
 
 
+def scrape_revenue_by_inn(
+    inn: str,
+    section_title: str = DEFAULT_SECTION_TITLE,
+    field_label: str = DEFAULT_FIELD_LABEL,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    render: bool = False,
+    fallback_render: bool = True,
+) -> RevenueResult:
+    query = normalize_inn(inn)
+    search_url = SEARCH_URL_TEMPLATE.format(query=quote_plus(query))
+    url = open_single_search_result(search_url=search_url, timeout_seconds=timeout_seconds)
+    return scrape_revenue(
+        url=url,
+        section_title=section_title,
+        field_label=field_label,
+        timeout_seconds=timeout_seconds,
+        render=render,
+        fallback_render=fallback_render,
+    )
+
+
 def scrape_revenue_all_years(
     url: str,
     section_title: str = DEFAULT_SECTION_TITLE,
@@ -623,6 +649,23 @@ def scrape_revenue_all_years(
         context.close()
         browser.close()
         playwright_ctx.stop()
+
+
+def scrape_revenue_all_years_by_inn(
+    inn: str,
+    section_title: str = DEFAULT_SECTION_TITLE,
+    field_label: str = DEFAULT_FIELD_LABEL,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+) -> list[RevenueResult]:
+    query = normalize_inn(inn)
+    search_url = SEARCH_URL_TEMPLATE.format(query=quote_plus(query))
+    url = open_single_search_result(search_url=search_url, timeout_seconds=timeout_seconds)
+    return scrape_revenue_all_years(
+        url=url,
+        section_title=section_title,
+        field_label=field_label,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def _build_url(args: argparse.Namespace) -> str:

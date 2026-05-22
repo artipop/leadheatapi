@@ -1,12 +1,11 @@
-import argparse
-import asyncio
-import csv
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from typing import TypedDict
 
 from bs4 import BeautifulSoup
 
+from app.datamining.contracts import SiteScrapeConfig
+from app.datamining.contracts import WriteRepository
 from app.datamining.sites.site_utils import build_browser_config
 from app.datamining.sites.site_utils import build_run_config
 from app.datamining.sites.site_utils import compact_spaces
@@ -37,6 +36,52 @@ class PriceEntry:
     price_min: str
     price_max: str
     currency: str
+
+
+class PriceRow(TypedDict):
+    domain: str
+    source_url: str
+    service: str
+    price_raw: str
+    price_min: str
+    price_max: str
+    currency: str
+
+
+@dataclass(frozen=True, slots=True)
+class PricingScraperConfig(SiteScrapeConfig):
+    pass
+
+
+class PricingScraper:
+    def __init__(
+        self,
+        config: PricingScraperConfig | None = None,
+        repository: WriteRepository[PriceRow] | None = None,
+    ) -> None:
+        self.config = config or PricingScraperConfig()
+        self.repository = repository
+
+    async def scrape(self, site: str) -> list[PriceRow]:
+        pages = await crawl_pages(site, self.config)
+        items = price_rows_from_pages(site, pages)
+        if self.repository:
+            self.repository.add_many(items)
+        return items
+
+
+async def crawl_pages(site: str, config: SiteScrapeConfig):
+    browser_config = build_browser_config()
+    run_config = build_run_config()
+    async with create_crawler(browser_config) as crawler:
+        return await crawl_site_pages(
+            crawler=crawler,
+            start_url=site,
+            max_pages=max(1, config.max_pages),
+            run_config=run_config,
+            verbose=config.verbose,
+            page_concurrency=max(1, config.page_concurrency),
+        )
 
 
 def to_price_value(raw_number: str) -> str:
@@ -140,59 +185,26 @@ def extract_prices(pages, domain: str) -> list[PriceEntry]:
     return items
 
 
-def write_pricing_csv(path: Path, prices) -> None:
-    with path.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=["domain", "source_url", "service", "price_raw", "price_min", "price_max", "currency"],
-        )
-        writer.writeheader()
-        for item in prices:
-            writer.writerow(
-                {
-                    "domain": item.domain,
-                    "source_url": item.source_url,
-                    "service": item.service,
-                    "price_raw": item.price_raw,
-                    "price_min": item.price_min,
-                    "price_max": item.price_max,
-                    "currency": item.currency,
-                }
-            )
-
-
-def prices_from_pages(site: str, pages) -> list:
+def prices_from_pages(site: str, pages) -> list[PriceEntry]:
     return extract_prices(pages, domain_slug(site))
 
 
-async def collect_prices(site: str, max_pages: int = 40) -> list:
-    browser_config = build_browser_config()
-    run_config = build_run_config()
-    async with create_crawler(browser_config) as crawler:
-        pages = await crawl_site_pages(
-            crawler=crawler,
-            start_url=site,
-            max_pages=max(1, max_pages),
-            run_config=run_config,
-            verbose=False,
-            page_concurrency=1,
-        )
-    return prices_from_pages(site, pages)
+def price_entry_to_row(item: PriceEntry) -> PriceRow:
+    return {
+        "domain": item.domain,
+        "source_url": item.source_url,
+        "service": item.service,
+        "price_raw": item.price_raw,
+        "price_min": item.price_min,
+        "price_max": item.price_max,
+        "currency": item.currency,
+    }
 
 
-def cli() -> None:
-    parser = argparse.ArgumentParser(description="Extract pricing rows from a site.")
-    parser.add_argument("--site", required=True)
-    parser.add_argument("--max-pages", type=int, default=40)
-    parser.add_argument("--output-csv", required=True)
-    args = parser.parse_args()
-
-    prices = asyncio.run(collect_prices(args.site, max_pages=max(1, args.max_pages)))
-    output_path = Path(args.output_csv)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    write_pricing_csv(output_path, prices)
-    print(f"Saved {len(prices)} rows to {output_path}")
+def price_rows_from_pages(site: str, pages) -> list[PriceRow]:
+    return [price_entry_to_row(item) for item in prices_from_pages(site, pages)]
 
 
-if __name__ == "__main__":
-    cli()
+async def collect_prices(site: str, max_pages: int = 40) -> list[PriceRow]:
+    scraper = PricingScraper(PricingScraperConfig(max_pages=max_pages))
+    return await scraper.scrape(site)

@@ -101,7 +101,7 @@ def main():
     parser.add_argument("url", help="Image URL to download and analyse")
     parser.add_argument("class_name", help="YOLO class to look for (e.g. 'tv', 'person')")
     parser.add_argument(
-        "--model",
+        "--model",  # todo: try yolo26m
         default="yolo11m.pt",
         help="Model weights (default: yolo11m.pt). Options: yolo11n/s/m/l/x.pt",
     )

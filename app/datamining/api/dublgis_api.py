@@ -11,6 +11,10 @@ from urllib.request import urlopen
 
 logger = logging.getLogger(__name__)
 
+ITEMS_API_URL = "https://catalog.api.2gis.com/3.0/items"
+REGION_SEARCH_API_URL = "https://catalog.api.2gis.com/2.0/region/search"
+RUBRIC_SEARCH_API_URL = "https://catalog.api.2gis.com/2.0/catalog/rubric/search"
+
 
 class DublgisApiError(Exception):
     def __init__(self, status_code: Any, payload: dict[str, Any]):
@@ -21,10 +25,63 @@ class DublgisApiError(Exception):
 
 @dataclass
 class DublgisApiClient:
-    api_url: str = "https://catalog.api.2gis.com/3.0/items"
+    api_url: str = ITEMS_API_URL
+    region_search_url: str = REGION_SEARCH_API_URL
+    rubric_search_url: str = RUBRIC_SEARCH_API_URL
     timeout_seconds: int = 20
     max_retries: int = 3
     retry_delay_seconds: float = 1.0
+
+    def _fetch_json(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
+        request_url = f"{url}?{urlencode(params)}"
+        with urlopen(request_url, timeout=self.timeout_seconds) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        meta = payload.get("meta", {})
+        status_code = meta.get("code")
+        if status_code == 200:
+            return payload
+        raise DublgisApiError(status_code=status_code, payload=payload)
+
+    def search_regions(
+        self,
+        query: str,
+        api_key: str,
+        page: int | None = None,
+        page_size: int | None = None,
+    ) -> dict[str, Any]:
+        if not query.strip():
+            raise ValueError("query must not be empty")
+        params = {
+            "q": query,
+            "key": api_key,
+        }
+        if page is not None:
+            params["page"] = page
+        if page_size is not None:
+            params["page_size"] = page_size
+        return self._fetch_json(self.region_search_url, params)
+
+    def search_rubrics(
+        self,
+        query: str,
+        region_id: int,
+        api_key: str,
+        page: int | None = None,
+        page_size: int | None = None,
+    ) -> dict[str, Any]:
+        if not query.strip():
+            raise ValueError("query must not be empty")
+        params = {
+            "q": query,
+            "region_id": region_id,
+            "key": api_key,
+        }
+        if page is not None:
+            params["page"] = page
+        if page_size is not None:
+            params["page_size"] = page_size
+        return self._fetch_json(self.rubric_search_url, params)
 
     def fetch_items_page(
         self,
@@ -181,6 +238,67 @@ def fetch_all_items(
     return items
 
 
+def items_to_csv_rows(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        rows.append({key: _serialize_csv_value(value) for key, value in item.items()})
+    return rows
+
+
+def fetch_all_item_rows(
+    rubric_ids: list[int],
+    region_id: int,
+    api_key: str,
+    page_size: int = 50,
+    search_type: str = "one_branch",
+    client: Optional[DublgisApiClient] = None,
+) -> list[dict[str, Any]]:
+    return items_to_csv_rows(
+        fetch_all_items(
+            rubric_ids=rubric_ids,
+            region_id=region_id,
+            api_key=api_key,
+            page_size=page_size,
+            search_type=search_type,
+            client=client,
+        )
+    )
+
+
+def search_regions(
+    query: str,
+    api_key: str,
+    page: int | None = None,
+    page_size: int | None = None,
+    client: Optional[DublgisApiClient] = None,
+) -> dict[str, Any]:
+    client = client or DublgisApiClient()
+    return client.search_regions(
+        query=query,
+        api_key=api_key,
+        page=page,
+        page_size=page_size,
+    )
+
+
+def search_rubrics(
+    query: str,
+    region_id: int,
+    api_key: str,
+    page: int | None = None,
+    page_size: int | None = None,
+    client: Optional[DublgisApiClient] = None,
+) -> dict[str, Any]:
+    client = client or DublgisApiClient()
+    return client.search_rubrics(
+        query=query,
+        region_id=region_id,
+        api_key=api_key,
+        page=page,
+        page_size=page_size,
+    )
+
+
 def _serialize_csv_value(value: Any) -> Any:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False)
@@ -188,11 +306,12 @@ def _serialize_csv_value(value: Any) -> Any:
 
 
 def write_items_to_csv(items: list[dict[str, Any]], output_csv: str) -> None:
-    logger.info("Writing %s items to CSV: %s", len(items), output_csv)
+    rows = items_to_csv_rows(items)
+    logger.info("Writing %s items to CSV: %s", len(rows), output_csv)
     fieldnames: list[str] = []
     seen: set[str] = set()
-    for item in items:
-        for key in item.keys():
+    for row in rows:
+        for key in row.keys():
             if key not in seen:
                 seen.add(key)
                 fieldnames.append(key)
@@ -203,8 +322,8 @@ def write_items_to_csv(items: list[dict[str, Any]], output_csv: str) -> None:
     with open(output_csv, "w", encoding="utf-8", newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()
-        for item in items:
-            row = {key: _serialize_csv_value(item.get(key)) for key in fieldnames}
+        for item in rows:
+            row = {key: item.get(key) for key in fieldnames}
             writer.writerow(row)
     logger.info("CSV saved: %s", output_csv)
 
@@ -226,7 +345,7 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
     args = _parse_args()
-    all_items = fetch_all_items(
+    all_items = fetch_all_item_rows(
         rubric_ids=args.rubric_id,
         region_id=args.region_id,
         api_key=args.api_key,

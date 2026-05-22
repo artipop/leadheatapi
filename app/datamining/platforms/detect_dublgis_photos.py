@@ -26,6 +26,8 @@ def main():
     parser.add_argument("--model", default="yolo11m.pt", help="YOLO model weights")
     parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold")
     parser.add_argument("--max-photos", type=int, default=None, help="Limit photos to check (default: all)")
+    parser.add_argument("--mode", choices=["api", "playwright"], default="api",
+                        help="Photo fetch mode: api (default) or playwright (no API key)")
     parser.add_argument("--list-classes", action="store_true", help="Print supported classes and exit")
     args = parser.parse_args()
 
@@ -41,7 +43,7 @@ def main():
         sys.exit(1)
 
     print(f"Fetching photos from: {args.firm_url}")
-    photos = get_firm_photos_by_url(args.firm_url, max_photos=args.max_photos)
+    photos = get_firm_photos_by_url(args.firm_url, max_photos=args.max_photos, mode=args.mode)
 
     if not photos:
         print("No photos found on that page.", file=sys.stderr)

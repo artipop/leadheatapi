@@ -5,7 +5,7 @@ import html
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, Mapping, Optional
+from typing import Any, Dict, Iterable, Iterator, Mapping, Optional, TypedDict
 
 import requests
 
@@ -14,6 +14,7 @@ import requests
 TOKEN_URL = "https://api.hh.ru/token"
 API_BASE_URL = "https://api.hh.ru"
 VACANCIES_URL = f"{API_BASE_URL}/vacancies"
+PROFESSIONAL_ROLE_SUGGESTS_URL = f"{API_BASE_URL}/suggests/professional_roles"
 DEFAULT_USER_AGENT = "hh-research/1.0"
 HTML_TAG_PATTERN = re.compile("<.*?>")
 WHITESPACE_PATTERN = re.compile(r"\s+")
@@ -52,6 +53,11 @@ class VacancySummary:
     schedule: str
     key_skills: list[str]
     description: str
+
+
+class VacancyTextRow(TypedDict):
+    employer: str
+    text: str
 
 
 def _headers(access_token: Optional[str], user_agent: Optional[str] = None) -> dict[str, str]:
@@ -157,6 +163,7 @@ def fetch_vacancies_page(
     params: Optional[Mapping[str, Any]] = None,
     *,
     professional_roles: Optional[Iterable[int]] = None,
+    text: Optional[str] = None,
     page: int = 0,
     per_page: int = 100,
     user_agent: Optional[str] = None,
@@ -172,6 +179,8 @@ def fetch_vacancies_page(
     search_params: dict[str, Any] = dict(params or {})
     if professional_roles is not None:
         search_params["professional_roles"] = professional_roles
+    if text:
+        search_params["text"] = text
 
     query = [
         (key, value)
@@ -200,6 +209,7 @@ def iter_vacancy_pages(
     params: Optional[Mapping[str, Any]] = None,
     *,
     professional_roles: Optional[Iterable[int]] = None,
+    text: Optional[str] = None,
     per_page: int = 100,
     max_pages: Optional[int] = None,
     user_agent: Optional[str] = None,
@@ -216,6 +226,7 @@ def iter_vacancy_pages(
             access_token,
             params,
             professional_roles=professional_roles,
+            text=text,
             page=page,
             per_page=per_page,
             user_agent=user_agent,
@@ -239,6 +250,7 @@ def fetch_all_vacancies(
     params: Optional[Mapping[str, Any]] = None,
     *,
     professional_roles: Optional[Iterable[int]] = None,
+    text: Optional[str] = None,
     per_page: int = 100,
     max_pages: Optional[int] = None,
     user_agent: Optional[str] = None,
@@ -251,6 +263,7 @@ def fetch_all_vacancies(
         access_token,
         params,
         professional_roles=professional_roles,
+        text=text,
         per_page=per_page,
         max_pages=max_pages,
         user_agent=user_agent,
@@ -259,6 +272,28 @@ def fetch_all_vacancies(
     ):
         vacancies.extend(payload.get("items", []))
     return vacancies
+
+
+def fetch_professional_role_suggestions(
+    text: str,
+    access_token: Optional[str] = None,
+    *,
+    user_agent: Optional[str] = None,
+    timeout: int = 30,
+    session: Any = requests,
+) -> dict[str, Any]:
+    query = text.strip()
+    if not query:
+        raise ValueError("text must not be empty")
+    return _request_json(
+        "GET",
+        PROFESSIONAL_ROLE_SUGGESTS_URL,
+        access_token=access_token,
+        user_agent=user_agent,
+        params={"text": query},
+        timeout=timeout,
+        session=session,
+    )
 
 
 def fetch_vacancy(
@@ -348,7 +383,7 @@ def vacancy_summary(
     )
 
 
-def vacancy_text(vacancy: Mapping[str, Any]) -> dict[str, str]:
+def vacancy_text(vacancy: Mapping[str, Any]) -> VacancyTextRow:
     """Extract only employer and vacancy text from full vacancy JSON."""
     name = str(vacancy.get("name", "")).strip()
     description = clean_tags(str(vacancy.get("description", ""))).strip()
@@ -364,17 +399,19 @@ def collect_vacancy_texts(
     query: Optional[Mapping[str, Any]] = None,
     *,
     professional_roles: Optional[Iterable[int]] = None,
+    text: Optional[str] = None,
     per_page: int = 100,
     max_pages: Optional[int] = None,
     user_agent: Optional[str] = None,
     timeout: int = 30,
     session: Any = requests,
-) -> list[dict[str, str]]:
+) -> list[VacancyTextRow]:
     """Search vacancies and return only employer and cleaned vacancy text."""
     items = fetch_all_vacancies(
         access_token,
         query,
         professional_roles=professional_roles,
+        text=text,
         per_page=per_page,
         max_pages=max_pages,
         user_agent=user_agent,
@@ -424,9 +461,9 @@ def main():
     vacancies = collect_vacancy_texts(
         token,
         {
-            "text": "FPGA",
             "area": 1,
         },
+        text="FPGA",
         professional_roles=args.professional_roles,
         per_page=50,
         max_pages=1,

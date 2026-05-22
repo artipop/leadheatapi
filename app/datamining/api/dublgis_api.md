@@ -42,3 +42,9 @@ sport
 20228 Центры йоги
 261 Бассейны
 110332 Аквааэробика
+
+### Контракты
+
+- `fetch_items_page(rubric_ids: list[int], region_id: int, api_key: str, page: int, page_size: int, search_type: str)`
+- `search_regions(query: str, api_key: str, page: int | None = None, page_size: int | None = None)`
+- `search_rubrics(query: str, region_id: int, api_key: str, page: int | None = None, page_size: int | None = None)`

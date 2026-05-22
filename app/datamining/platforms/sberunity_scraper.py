@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlencode, urljoin, urlparse
 
+from app.datamining.playwright_utils import cleanup_stale_profile_locks
+from app.datamining.playwright_utils import wait_until_sync
+
 STARTUPS_URL = "https://sberunity.ru/main/startups"
 STARTUP_LINK_SELECTOR = 'a[data-test-id="startups:item"]'
 STARTUP_FALLBACK_LINK_SELECTOR = 'a[href*="/main/startups/"]'
@@ -1214,6 +1217,7 @@ def run() -> int:
     output_path = Path(args.output)
     user_data_dir = Path(args.user_data_dir).expanduser().resolve()
     user_data_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_stale_profile_locks(user_data_dir)
 
     with sync_playwright() as playwright:
         own_context = False
@@ -1249,18 +1253,17 @@ def run() -> int:
                         "Startup cards are not visible yet. "
                         "If login is required, complete it in the open browser window."
                     )
-                    login_deadline = time.monotonic() + max(1, args.login_wait)
-                    cards_visible = False
-                    while time.monotonic() < login_deadline:
+                    def cards_visible_after_login() -> bool:
                         if startup_cards_count(list_page) > 0:
-                            cards_visible = True
-                            break
+                            return True
                         try:
                             if "/main/startups" not in (list_page.url or ""):
                                 list_page.goto(args.start_url, wait_until="domcontentloaded", timeout=timeout_ms)
                         except Exception:
                             pass
-                        list_page.wait_for_timeout(2000)
+                        return False
+
+                    cards_visible = wait_until_sync(cards_visible_after_login, args.login_wait, interval_ms=2_000)
                     if not cards_visible:
                         raise SberUnityScraperError("No startup cards found after waiting for login.")
                 else:

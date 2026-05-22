@@ -1,13 +1,12 @@
-import argparse
-import asyncio
-import csv
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from typing import TypedDict
 from urllib.parse import unquote
 
 from bs4 import BeautifulSoup
 
+from app.datamining.contracts import SiteScrapeConfig
+from app.datamining.contracts import WriteRepository
 from app.datamining.sites.site_utils import build_browser_config
 from app.datamining.sites.site_utils import build_run_config
 from app.datamining.sites.site_utils import compact_spaces
@@ -101,6 +100,51 @@ class SpecialistEntry:
     role: str
     phone: str
     email: str
+
+
+class SpecialistRow(TypedDict):
+    domain: str
+    source_url: str
+    full_name: str
+    role: str
+    phone: str
+    email: str
+
+
+@dataclass(frozen=True, slots=True)
+class SpecialistsScraperConfig(SiteScrapeConfig):
+    pass
+
+
+class SpecialistsScraper:
+    def __init__(
+        self,
+        config: SpecialistsScraperConfig | None = None,
+        repository: WriteRepository[SpecialistRow] | None = None,
+    ) -> None:
+        self.config = config or SpecialistsScraperConfig()
+        self.repository = repository
+
+    async def scrape(self, site: str) -> list[SpecialistRow]:
+        pages = await crawl_pages(site, self.config)
+        items = specialist_rows_from_pages(site, pages)
+        if self.repository:
+            self.repository.add_many(items)
+        return items
+
+
+async def crawl_pages(site: str, config: SiteScrapeConfig):
+    browser_config = build_browser_config()
+    run_config = build_run_config()
+    async with create_crawler(browser_config) as crawler:
+        return await crawl_site_pages(
+            crawler=crawler,
+            start_url=site,
+            max_pages=max(1, config.max_pages),
+            run_config=run_config,
+            verbose=config.verbose,
+            page_concurrency=max(1, config.page_concurrency),
+        )
 
 
 def find_name(text: str) -> str:
@@ -259,58 +303,25 @@ def extract_specialists(pages, domain: str) -> list[SpecialistEntry]:
     return filtered
 
 
-def write_specialists_csv(path: Path, specialists) -> None:
-    with path.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=["domain", "source_url", "full_name", "role", "phone", "email"],
-        )
-        writer.writeheader()
-        for item in specialists:
-            writer.writerow(
-                {
-                    "domain": item.domain,
-                    "source_url": item.source_url,
-                    "full_name": item.full_name,
-                    "role": item.role,
-                    "phone": item.phone,
-                    "email": item.email,
-                }
-            )
-
-
-def specialists_from_pages(site: str, pages) -> list:
+def specialists_from_pages(site: str, pages) -> list[SpecialistEntry]:
     return extract_specialists(pages, domain_slug(site))
 
 
-async def collect_specialists(site: str, max_pages: int = 40) -> list:
-    browser_config = build_browser_config()
-    run_config = build_run_config()
-    async with create_crawler(browser_config) as crawler:
-        pages = await crawl_site_pages(
-            crawler=crawler,
-            start_url=site,
-            max_pages=max(1, max_pages),
-            run_config=run_config,
-            verbose=False,
-            page_concurrency=1,
-        )
-    return specialists_from_pages(site, pages)
+def specialist_entry_to_row(item: SpecialistEntry) -> SpecialistRow:
+    return {
+        "domain": item.domain,
+        "source_url": item.source_url,
+        "full_name": item.full_name,
+        "role": item.role,
+        "phone": item.phone,
+        "email": item.email,
+    }
 
 
-def cli() -> None:
-    parser = argparse.ArgumentParser(description="Extract specialists from a site.")
-    parser.add_argument("--site", required=True)
-    parser.add_argument("--max-pages", type=int, default=40)
-    parser.add_argument("--output-csv", required=True)
-    args = parser.parse_args()
-
-    specialists = asyncio.run(collect_specialists(args.site, max_pages=max(1, args.max_pages)))
-    output_path = Path(args.output_csv)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    write_specialists_csv(output_path, specialists)
-    print(f"Saved {len(specialists)} rows to {output_path}")
+def specialist_rows_from_pages(site: str, pages) -> list[SpecialistRow]:
+    return [specialist_entry_to_row(item) for item in specialists_from_pages(site, pages)]
 
 
-if __name__ == "__main__":
-    cli()
+async def collect_specialists(site: str, max_pages: int = 40) -> list[SpecialistRow]:
+    scraper = SpecialistsScraper(SpecialistsScraperConfig(max_pages=max_pages))
+    return await scraper.scrape(site)
